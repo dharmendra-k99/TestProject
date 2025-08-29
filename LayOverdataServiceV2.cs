@@ -1,18 +1,10 @@
 using Clob.AC.Application.Common;
 using Clob.AC.Application.Dtos.CrewInfo;
-using Clob.AC.Application.Dtos.CrewQualification;
-using Clob.AC.Application.Dtos.Meals.CrewMeals;
 using Clob.AC.Application.Extensions;
 using Clob.AC.Application.IServices;
-using Clob.AC.Domain.Models;
-using Clob.AC.Domain.ValueObjects;
 using Clob.Flight.Domain.Models;
 using Microsoft.Extensions.Logging;
-using System.Diagnostics.Metrics;
 using System.Collections.Concurrent;
-using System.Threading.Tasks.Dataflow;
-using System.Text;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Clob.AC.Application.Services
 {
@@ -45,13 +37,13 @@ namespace Clob.AC.Application.Services
         private HashSet<string> ExistingLayoverKeys = new();
         private ConcurrentBag<LayoverDataV2> createLayoverData = new();
         private ConcurrentBag<LayoverDataV2> existingLayoverData = new();
-        
+
         // Pre-computed lookup tables for performance
         private Dictionary<string, HashSet<int>> MealCrewRankLookup = new();
         private Dictionary<int, HashSet<int>> MealCategoryLookup = new();
         private Dictionary<string, HashSet<int>> MealAircraftTypeLookup = new();
         private DateTime _currentDateTime;
-        
+
         // Admin configuration lookup tables
         private Dictionary<string, HashSet<long>> AdminCrewRankLookup = new();
         private Dictionary<string, HashSet<long>> AdminDutyTypeLookup = new();
@@ -59,23 +51,23 @@ namespace Clob.AC.Application.Services
         private Dictionary<string, HashSet<long>> AdminCityLookup = new();
         private Dictionary<int, HashSet<long>> AdminCategoryLookup = new();
         private Dictionary<long, AdminConfiguration> AdminConfigLookup = new();
-        
+
         // Adhoc allowance lookup tables  
         private Dictionary<string, HashSet<int>> AdhocCrewRankLookup = new();
         private Dictionary<string, HashSet<int>> AdhocCountryLookup = new();
         private Dictionary<int, HashSet<int>> AdhocCategoryLookup = new();
         private Dictionary<int, AdhocAllowance> AdhocAllowanceLookup = new();
-        
+
         // Pre-calculated duration lookups for performance
         private Dictionary<long, double> AdminConfigDurationFromLookup = new();
         private Dictionary<long, double> AdminConfigDurationToLookup = new();
         private Dictionary<long, double> AdminConfigSlabCapLookup = new();
-        
+
         // Performance optimizations for data creation
         private DateTime _cachedUtcNow;
         private readonly StringBuilder _keyBuilder = new StringBuilder(200);
         private const int DefaultCreatedBy = 1234;
-        
+
         // Object pools for reducing allocations
         private readonly Queue<InternationalLayoverReport> _layoverReportPool = new();
         private readonly Queue<CrewMealReportV2> _mealReportPool = new();
@@ -140,17 +132,17 @@ namespace Clob.AC.Application.Services
                 {
                     Console.WriteLine($"Loading reference data...");
                     var dataLoadingStartTime = DateTime.Now;
-                    
+
                     // Load all reference data sequentially to avoid DbContext concurrency issues
                     // Note: Each method internally can still use parallel operations with separate contexts if needed
                     await LoadStationMasterData();
                     await LoadCurrencyData();
                     await LoadConfigurationData(fromDate, toDate);
-                    
+
                     categoryIds = await _dbContext.CrewCategoryData.Select(x => x.CrewCategoryId).ToListAsync();
-                    
+
                     await LoadExistingLayoverData(fromDate, toDate, crewList);
-                    
+
                     Console.WriteLine($"Reference data loaded in {(DateTime.Now - dataLoadingStartTime).TotalSeconds} seconds.");
 
                     // Data loading completed in parallel tasks above
@@ -159,25 +151,25 @@ namespace Clob.AC.Application.Services
                     // Process crews in parallel with optimized batching
                     var maxConcurrency = Math.Min(Environment.ProcessorCount * 2, 10); // Limit concurrent operations
                     var batchSize = Math.Min(1000, Math.Max(100, totalCrewEmp / maxConcurrency)); // Dynamic batch size
-                    
+
                     Console.WriteLine($"Processing {totalCrewEmp} crew members with max concurrency: {maxConcurrency}, batch size: {batchSize}");
-                    
+
                     var semaphore = new SemaphoreSlim(maxConcurrency);
                     var processingTasks = new List<Task>();
-                    
+
                     for (int i = 0; i < totalCrewEmp; i += batchSize)
                     {
                         var batchStart = i;
                         var batchEnd = Math.Min(i + batchSize, totalCrewEmp);
                         var batchEmplst = crewList.Skip(batchStart).Take(batchEnd - batchStart).ToList();
-                        
+
                         var task = ProcessCrewBatchAsync(batchEmplst, fromDate, toDate, crewInformation, categoryIds, request.FromDate, semaphore, batchStart / batchSize + 1);
                         processingTasks.Add(task);
                     }
-                    
+
                     await Task.WhenAll(processingTasks);
                     semaphore.Dispose();
-                    
+
                     // Process all collected data in a single database transaction
                     await SaveLayoverDataBulk(rosterResponse);
                 }
@@ -193,7 +185,7 @@ namespace Clob.AC.Application.Services
             {
                 // Clean up memory
                 CleanupMemory();
-                
+
                 //logging
                 await AddReportHistory(reportHistoryModel, rosterResponse);
             }
@@ -322,7 +314,7 @@ namespace Clob.AC.Application.Services
             {
                 // Pre-compute values to avoid repeated calculations
                 double toHours = availableSlabs.DurationToMinutes / 60.0 + availableSlabs.DurationToHours;
-                
+
                 if (targetTotalhours > toHours)
                 {
                     double slabCapHours = availableSlabs.HourlySlabMinutes / 60.0 + availableSlabs.HourlySlabHours;
@@ -351,7 +343,7 @@ namespace Clob.AC.Application.Services
             {
                 if (adhoc.EffectiveFrom <= date && (adhoc.EffectiveTo == null || adhoc.EffectiveTo >= date))
                 {
-                    validAdhocIds.Add(adhoc.Id.Value);
+                    validAdhocIds.Add(adhoc.Id.Value.ToInt());
                 }
             }
 
@@ -403,14 +395,14 @@ namespace Clob.AC.Application.Services
             if (bestAdhocSlab == null) return 0;
 
             var adhocTime = (int)Math.Ceiling(targetTotalhours / bestAdhocSlab.PerHourSlabHours);
-            return adhocTime * (bestAdhocSlab.Amount ?? 0);
+            return adhocTime * bestAdhocSlab.Amount;
         }
 
         private void CreateLayoverDataOptimized(LayoverDataV2 layoverData, InternationalLayoverReport layoverReport, CrewMealReportV2 crewMealReport)
         {
             // Generate unique key efficiently using StringBuilder
             var uniqueKey = BuildUniqueKey(layoverData);
-            
+
             // Early duplicate check - exit immediately if duplicate found
             if (ExistingLayoverKeys.Contains(uniqueKey))
                 return;
@@ -447,10 +439,10 @@ namespace Clob.AC.Application.Services
             _keyBuilder.Append('_');
             _keyBuilder.Append(layoverData.ArrivalStation);
             _keyBuilder.Append('_');
-            _keyBuilder.Append(layoverData.StayStart.ToString("yyyyMMddHHmm"));
+            _keyBuilder.Append(layoverData.StayStart?.ToString("yyyyMMddHHmm"));
             _keyBuilder.Append('_');
             _keyBuilder.Append(layoverData.StayEnd?.ToString("yyyyMMddHHmm") ?? "null");
-            
+
             return _keyBuilder.ToString();
         }
 
@@ -500,7 +492,7 @@ namespace Clob.AC.Application.Services
         }
 
         #region Optimized Data Loading Methods
-        
+
         private async Task LoadStationMasterData()
         {
             StationMaster = await _dbContext.StationMasters.Where(x => x.IsActive ?? true).ToListAsync();
@@ -522,7 +514,7 @@ namespace Clob.AC.Application.Services
                     ValueInINR = currency.ValueInINR ?? 0,
                     CountryName = country.CountryName ?? "",
                 }).Distinct().ToListAsync();
-                
+
             // Create lookup for O(1) access
             CurrencyLookup = CurrenciesData.ToDictionary(x => x.CountryId, x => x);
         }
@@ -553,7 +545,7 @@ namespace Clob.AC.Application.Services
                 AdminNonDutyTypes = await _dbContext.AdminConfigNBDutyType.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync();
                 AdminConfigCities = await _dbContext.AdminConfigCity.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync();
                 AdminCategory = await _dbContext.AdminConfigCrewCategory.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync();
-                
+
                 // Build optimized admin configuration lookup tables
                 BuildAdminConfigLookupTables();
             }
@@ -563,32 +555,32 @@ namespace Clob.AC.Application.Services
         {
             // Build admin config lookup by ID
             AdminConfigLookup = ConfigurationSlabs.ToDictionary(x => x.Id.Value, x => x);
-            
+
             // Build crew rank lookup: rank -> set of config IDs
             AdminCrewRankLookup = CrewRanks
                 .GroupBy(x => x.CrewRankName?.ToUpper() ?? "")
                 .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
-            
+
             // Build duty type lookup: dutyType -> set of config IDs
             AdminDutyTypeLookup = AdminDutyTypes
                 .GroupBy(x => x.DutyType ?? "")
                 .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
-            
+
             // Build non-duty type lookup: nonDutyType -> set of config IDs
             AdminNonDutyTypeLookup = AdminNonDutyTypes
                 .GroupBy(x => x.NBDutyTypeName ?? "")
                 .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
-            
+
             // Build city lookup: cityId -> set of config IDs
             AdminCityLookup = AdminConfigCities
                 .GroupBy(x => x.CityId ?? "")
                 .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
-            
+
             // Build category lookup: categoryId -> set of config IDs
             AdminCategoryLookup = AdminCategory
                 .GroupBy(x => x.CategoryId)
                 .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
-            
+
             // Pre-calculate durations for performance
             foreach (var config in ConfigurationSlabs)
             {
@@ -613,10 +605,10 @@ namespace Clob.AC.Application.Services
                 MealCrewRanks = await _dbContext.MealConfigCrewRanks.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync();
                 MealCrewCategoris = await _dbContext.MealConfigCrewCategories.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync();
                 MealAircraftTypes = await _dbContext.MealConfigAircraftTypes.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync();
-                
+
                 // Create lookup for meal configurations by station
                 MealConfigByStation = MealConfigurations.GroupBy(x => x.Station).ToDictionary(g => g.Key, g => g.ToList());
-                
+
                 // Build optimized meal lookup tables
                 BuildMealLookupTables();
             }
@@ -636,7 +628,7 @@ namespace Clob.AC.Application.Services
                 AdhocCrewRanks = await _dbContext.AdhocCrewRank.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync();
                 AdhocCountries = await _dbContext.AdhocCountry.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync();
                 AdhocCrewCategories = await _dbContext.AdhocCrewCategory.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync();
-                
+
                 // Build optimized adhoc allowance lookup tables
                 BuildAdhocLookupTables();
             }
@@ -645,18 +637,18 @@ namespace Clob.AC.Application.Services
         private void BuildAdhocLookupTables()
         {
             // Build adhoc allowance lookup by ID
-            AdhocAllowanceLookup = AdhocAllowanceConfig.ToDictionary(x => x.Id.Value, x => x);
-            
+            AdhocAllowanceLookup = AdhocAllowanceConfig.ToDictionary(x => x.Id.Value.ToInt(), x => x);
+
             // Build crew rank lookup: rank -> set of adhoc IDs
             AdhocCrewRankLookup = AdhocCrewRanks
                 .GroupBy(x => x.CrewRankName ?? "")
                 .ToDictionary(g => g.Key, g => g.Select(x => x.AdhocId).ToHashSet());
-            
+
             // Build country lookup: countryId -> set of adhoc IDs
             AdhocCountryLookup = AdhocCountries
                 .GroupBy(x => x.CountryId ?? "")
                 .ToDictionary(g => g.Key, g => g.Select(x => x.AdhocId).ToHashSet());
-            
+
             // Build category lookup: categoryId -> set of adhoc IDs
             AdhocCategoryLookup = AdhocCrewCategories
                 .GroupBy(x => x.CategoryId)
@@ -669,7 +661,7 @@ namespace Clob.AC.Application.Services
                 .Where(x => crewList.Contains(x.IGA) && x.StayStart >= fromDate && x.StayEnd <= toDate)
                 .Select(x => $"{x.IGA}_{x.InboundFlight}_{x.OutboundFlight}_{x.DepartureStation}_{x.ArrivalStation}_{x.StayStart:yyyyMMddHHmm}_{x.StayEnd:yyyyMMddHHmm}")
                 .ToListAsync();
-                
+
             ExistingLayoverKeys = new HashSet<string>(existingKeys);
         }
 
@@ -677,21 +669,21 @@ namespace Clob.AC.Application.Services
         {
             // Cache current datetime to avoid repeated calls
             _currentDateTime = DateTime.Now;
-            
+
             // Build crew rank lookup: rank -> set of meal config IDs
             MealCrewRankLookup = MealCrewRanks
                 .GroupBy(x => x.CrewRankName?.ToUpper() ?? "")
-                .ToDictionary(g => g.Key, g => g.Select(x => x.MealConfigId).ToHashSet());
-            
+                .ToDictionary(g => g.Key, g => g.Select(x => x.MealConfigId.ToInt()).ToHashSet());
+
             // Build category lookup: categoryId -> set of meal config IDs  
             MealCategoryLookup = MealCrewCategoris
                 .GroupBy(x => x.CategoryId)
-                .ToDictionary(g => g.Key, g => g.Select(x => x.MealConfigId).ToHashSet());
-            
+                .ToDictionary(g => g.Key, g => g.Select(x => x.MealConfigId.ToInt()).ToHashSet());
+
             // Build aircraft type lookup: aircraftType -> set of meal config IDs
             MealAircraftTypeLookup = MealAircraftTypes
                 .GroupBy(x => x.AircraftTypeId?.Trim() ?? "")
-                .ToDictionary(g => g.Key, g => g.Select(x => x.MealConfigId).ToHashSet());
+                .ToDictionary(g => g.Key, g => g.Select(x => x.MealConfigId.ToInt()).ToHashSet());
         }
 
         private async Task<List<CrewLayoverRoaster>> LoadCrewLayoverDataBatch(List<long> batchEmplst, DateTime fromDate, DateTime toDate)
@@ -718,8 +710,8 @@ namespace Clob.AC.Application.Services
                 .ToListAsync();
         }
 
-        private async Task ProcessCrewBatchAsync(List<long> batchEmplst, DateTime fromDate, DateTime toDate, 
-            List<CrewDetailDto> crewInformation, List<int> categoryIds, DateTime layOverfromDate, 
+        private async Task ProcessCrewBatchAsync(List<long> batchEmplst, DateTime fromDate, DateTime toDate,
+            List<CrewDetailDto> crewInformation, List<int> categoryIds, DateTime layOverfromDate,
             SemaphoreSlim semaphore, int batchNumber)
         {
             await semaphore.WaitAsync();
@@ -727,16 +719,16 @@ namespace Clob.AC.Application.Services
             {
                 var batchStartTime = DateTime.Now;
                 Console.WriteLine($"Batch {batchNumber}: Starting processing of {batchEmplst.Count} crew members at {batchStartTime.TimeOfDay}");
-                
+
                 // Load crew layover data for this batch
                 var crewLayoverData = await LoadCrewLayoverDataBatch(batchEmplst, fromDate, toDate);
-                
+
                 if (crewLayoverData.Count > 0)
                 {
                     // Process crews in this batch in parallel
                     await ProcessCrewLayoverDataParallel(crewLayoverData, crewInformation, layOverfromDate, categoryIds);
                 }
-                
+
                 Console.WriteLine($"Batch {batchNumber}: Completed processing in {(DateTime.Now - batchStartTime).TotalSeconds} seconds");
             }
             finally
@@ -745,12 +737,12 @@ namespace Clob.AC.Application.Services
             }
         }
 
-        private async Task ProcessCrewLayoverDataParallel(List<CrewLayoverRoaster> crewLayoverData, 
+        private async Task ProcessCrewLayoverDataParallel(List<CrewLayoverRoaster> crewLayoverData,
             List<CrewDetailDto> crewInformationData, DateTime layOverfromDate, List<int> categoryIds)
         {
             var grouped = crewLayoverData.GroupBy(f => f.EmpNo);
             var crewInformationLookup = crewInformationData.ToDictionary(x => x.EmpNo, x => x);
-            
+
             // Process each crew member in parallel within the batch
             var crewTasks = grouped.Select(async group =>
             {
@@ -759,7 +751,7 @@ namespace Clob.AC.Application.Services
                     await CalculateLayoverHoursOptimized(group, crewInfo, categoryIds, layOverfromDate);
                 }
             });
-            
+
             await Task.WhenAll(crewTasks);
         }
 
@@ -772,7 +764,7 @@ namespace Clob.AC.Application.Services
         {
             // Cache DateTime.UtcNow once for this crew member processing
             _cachedUtcNow = DateTime.UtcNow;
-            
+
             // Pre-compute crew information once
             var crewRank = crewInfo?.CrewRank?.ToUpper() ?? "";
             var IGA = crewInfo?.EmpNo ?? 0;
@@ -795,7 +787,7 @@ namespace Clob.AC.Application.Services
             {
                 var current = crewFlights[i];
                 var next = i == crewFlights.Length - 1 ? null : crewFlights[i + 1];
-                
+
                 // Skip duplicates early
                 if (IsDuplicateRecord(current, next)) continue;
 
@@ -806,7 +798,7 @@ namespace Clob.AC.Application.Services
                 if (!StationMasterLookup.TryGetValue(currentStay, out var stationData)) continue;
 
                 // Calculate layover timing
-                var (stayStart, stayEnd, layoverStayHours, layoverStayMinutes, isActualData) = 
+                var (stayStart, stayEnd, layoverStayHours, layoverStayMinutes, isActualData) =
                     CalculateLayoverTiming(current, next, _currentDateTime);
 
                 // Skip if no layover or missing required data
@@ -844,7 +836,7 @@ namespace Clob.AC.Application.Services
         private static string BuildCrewName(CrewDetailDto crewInfo)
         {
             if (crewInfo == null) return "";
-            
+
             var parts = new[] { crewInfo.FirstName, crewInfo.MiddleName, crewInfo.LastName };
             return string.Join(" ", parts.Where(name => !string.IsNullOrWhiteSpace(name)));
         }
@@ -866,7 +858,7 @@ namespace Clob.AC.Application.Services
         {
             previousMonthRecordAdded = false;
             var crewFlights = allCrewFlights.Where(x => x.Sta >= layOverfromDate).ToList();
-            
+
             if (crewFlights.Count > 0)
             {
                 var previousMonthLastDayFlights = allCrewFlights
@@ -878,7 +870,7 @@ namespace Clob.AC.Application.Services
                 var isDutyStartFromNonBase = !string.IsNullOrEmpty(firstDutyOfMonth.Dep) &&
                                            !string.IsNullOrEmpty(firstDutyOfMonth.CrewBase) &&
                                            firstDutyOfMonth.Dep != firstDutyOfMonth.CrewBase;
-                                           
+
                 if (isDutyStartFromNonBase && previousMonthLastDayFlights != null)
                 {
                     crewFlights.Add(previousMonthLastDayFlights);
@@ -886,7 +878,7 @@ namespace Clob.AC.Application.Services
                     previousMonthRecordAdded = true;
                 }
             }
-            
+
             return crewFlights.ToArray();
         }
 
@@ -899,7 +891,7 @@ namespace Clob.AC.Application.Services
                    current.ActDep == next.ActDep;
         }
 
-        private static (DateTime stayStart, DateTime? stayEnd, int layoverStayHours, int layoverStayMinutes, bool isActualData) 
+        private static (DateTime stayStart, DateTime? stayEnd, int layoverStayHours, int layoverStayMinutes, bool isActualData)
             CalculateLayoverTiming(CrewLayoverRoaster current, CrewLayoverRoaster next, DateTime currentDateTime)
         {
             bool isActArrValidDate = current.ActArr.Year > 2000;
@@ -914,7 +906,7 @@ namespace Clob.AC.Application.Services
             DateTime? stayEnd;
             bool isActualData = false;
 
-            if (!(isActDepFutureDate || isActArrFutureDate || isNextActDepFutureDate) && 
+            if (!(isActDepFutureDate || isActArrFutureDate || isNextActDepFutureDate) &&
                 (isActDepValidDate && isActArrValidDate && isNextActDepValidDate))
             {
                 stayStart = current.ActArr;
@@ -943,10 +935,10 @@ namespace Clob.AC.Application.Services
         private static bool HasValidFlightData(CrewLayoverRoaster current, CrewLayoverRoaster next, int index, bool previousMonthRecordAdded)
         {
             if (index == 0 && previousMonthRecordAdded) return false;
-            
+
             var inboundFlight = current.Flt > 0 ? current.Flt.ToString() : "";
             var outBoundFlight = next?.Flt > 0 ? next.Flt.ToString() : "";
-            
+
             return !string.IsNullOrWhiteSpace(inboundFlight) &&
                    !string.IsNullOrWhiteSpace(outBoundFlight) &&
                    !string.IsNullOrWhiteSpace(current.Dep) &&
@@ -987,7 +979,7 @@ namespace Clob.AC.Application.Services
             if (isMealConfigExist)
             {
                 var mealConfig = FindOptimalMealConfiguration(current, stayStart, stayEnd, currentStay, mealCrewRankIds, mealCategoryIds);
-                
+
                 if (mealConfig != null)
                 {
                     restaurant = mealConfig.Restaurant;
@@ -1010,7 +1002,7 @@ namespace Clob.AC.Application.Services
 
             var aircraftTypes = (current.AirCraftType?.Trim() ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
                 .Select(x => x.Trim()).ToHashSet();
-            
+
             var mealAircraftConfigIds = new HashSet<int>();
             foreach (var aircraftType in aircraftTypes)
             {
@@ -1031,9 +1023,9 @@ namespace Clob.AC.Application.Services
                           m.ClosingTime.HasValue &&
                           m.ClosingTime.Value.Add(TimeSpan.FromMinutes(m.BaseDepartureTimeDelay)) >= toTime &&
                           !(fromTime < m.BlackoutEndTime && toTime > m.BlackoutStartTime) &&
-                          mealCategoryIds.Contains(m.Id.Value) &&
-                          mealCrewRankIds.Contains(m.Id.Value) &&
-                          mealAircraftConfigIds.Contains(m.Id.Value) &&
+                          mealCategoryIds.Contains(m.Id.Value.ToInt()) &&
+                          mealCrewRankIds.Contains(m.Id.Value.ToInt()) &&
+                          mealAircraftConfigIds.Contains(m.Id.Value.ToInt()) &&
                           m.TerminalNo == terminalNo)
                 .OrderBy(m => m.PriorityIndex)
                 .FirstOrDefault();
@@ -1104,78 +1096,78 @@ namespace Clob.AC.Application.Services
             var transactionTime = DateTime.Now;
             Console.WriteLine($"Bulk save transaction begin at {transactionTime.TimeOfDay}");
             Console.WriteLine($"Total layover records to save: {createLayoverData.Count}");
-            
+
             using var transaction = _dbContext.Database.BeginTransaction();
-            
+
             try
             {
                 var existingDataList = existingLayoverData.ToList();
                 var createDataList = createLayoverData.ToList();
-                
+
                 // Delete existing records in bulk
                 if (existingDataList.Any())
                 {
                     Console.WriteLine($"Deleting {existingDataList.Count} existing records...");
-                    
+
                     var existingCrewMeals = existingDataList
                         .Where(p => p.CrewMealReport != null)
                         .Select(p => p.CrewMealReport)
                         .ToList();
-                        
+
                     var existingLayoverReport = existingDataList
                         .Where(p => p.LayoverReport != null)
                         .Select(p => p.LayoverReport)
                         .ToList();
-                    
+
                     if (existingCrewMeals.Any())
                         await _dbContext.CrewMealReportV2.BulkDeleteAsync(existingCrewMeals);
-                        
+
                     if (existingLayoverReport.Any())
                         await _dbContext.InternationalLayoverReport.BulkDeleteAsync(existingLayoverReport);
-                        
+
                     await _dbContext.LayoverDataV2.BulkDeleteAsync(existingDataList);
                 }
-                
+
                 // Insert new records in bulk
                 if (createDataList.Any())
                 {
                     Console.WriteLine($"Inserting {createDataList.Count} new records...");
-                    
+
                     await _dbContext.LayoverDataV2.BulkInsertAsync(createDataList);
-                    
+
                     // Update foreign keys for related entities
                     createDataList
                         .Where(e => e.CrewMealReport != null)
                         .ToList()
                         .ForEach(e => e.CrewMealReport.LayoverDataId = e.Id);
-                        
+
                     createDataList
                         .Where(e => e.LayoverReport != null)
                         .ToList()
                         .ForEach(e => e.LayoverReport.LayoverDataId = e.Id);
-                    
+
                     var entityCrewMeals = createDataList
                         .Where(p => p.CrewMealReport != null)
                         .Select(p => p.CrewMealReport)
                         .ToList();
-                        
+
                     var entityLayoverReport = createDataList
                         .Where(p => p.LayoverReport != null)
                         .Select(p => p.LayoverReport)
                         .ToList();
-                    
+
                     if (entityCrewMeals.Any())
                         await _dbContext.CrewMealReportV2.BulkInsertAsync(entityCrewMeals);
-                        
+
                     if (entityLayoverReport.Any())
                         await _dbContext.InternationalLayoverReport.BulkInsertAsync(entityLayoverReport);
-                    
+
                     await _dbContext.SaveChangesAsync();
-                    
+
                     rosterResponse.Status = true;
                     rosterResponse.RowsInserted += createDataList.Count;
                 }
-                
+
                 transaction.Commit();
                 Console.WriteLine($"Bulk save completed in {(DateTime.Now - transactionTime).TotalSeconds} seconds");
             }
@@ -1191,7 +1183,7 @@ namespace Clob.AC.Application.Services
             try
             {
                 Console.WriteLine("Cleaning up memory...");
-                
+
                 // Clear all collections to free memory
                 StationMaster?.Clear();
                 ConfigurationSlabs?.Clear();
@@ -1210,19 +1202,19 @@ namespace Clob.AC.Application.Services
                 MealCrewQualifications?.Clear();
                 MealAircraftTypes?.Clear();
                 MealConfigurations?.Clear();
-                
+
                 // Clear optimized lookup structures
                 StationMasterLookup?.Clear();
                 CurrencyLookup?.Clear();
                 ConfigSlabsByCategory?.Clear();
                 MealConfigByStation?.Clear();
                 ExistingLayoverKeys?.Clear();
-                
+
                 // Clear performance lookup tables
                 MealCrewRankLookup?.Clear();
                 MealCategoryLookup?.Clear();
                 MealAircraftTypeLookup?.Clear();
-                
+
                 // Clear admin configuration lookup tables
                 AdminCrewRankLookup?.Clear();
                 AdminDutyTypeLookup?.Clear();
@@ -1230,34 +1222,34 @@ namespace Clob.AC.Application.Services
                 AdminCityLookup?.Clear();
                 AdminCategoryLookup?.Clear();
                 AdminConfigLookup?.Clear();
-                
+
                 // Clear adhoc allowance lookup tables
                 AdhocCrewRankLookup?.Clear();
                 AdhocCountryLookup?.Clear();
                 AdhocCategoryLookup?.Clear();
                 AdhocAllowanceLookup?.Clear();
-                
+
                 // Clear pre-calculated duration lookups
                 AdminConfigDurationFromLookup?.Clear();
                 AdminConfigDurationToLookup?.Clear();
                 AdminConfigSlabCapLookup?.Clear();
-                
+
                 // Clear object pools
                 _layoverReportPool.Clear();
                 _mealReportPool.Clear();
-                
+
                 // Reset StringBuilder
                 _keyBuilder.Clear();
-                
+
                 // Clear concurrent collections
                 createLayoverData = new ConcurrentBag<LayoverDataV2>();
                 existingLayoverData = new ConcurrentBag<LayoverDataV2>();
-                
+
                 // Force garbage collection
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
                 GC.Collect();
-                
+
                 Console.WriteLine("Memory cleanup completed.");
             }
             catch (Exception ex)
