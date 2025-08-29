@@ -220,6 +220,21 @@ namespace Clob.AC.Application.Services
 
                     // Process all collected data in a single database transaction
                     await SaveLayoverDataBulk(rosterResponse);
+
+                    // Final processing summary
+                    var processingEndTime = DateTime.Now;
+                    var overallDuration = (processingEndTime - dataLoadingStartTime).TotalMinutes;
+                    var finalMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
+                    var totalRecordsCreated = createLayoverData.Count;
+                    var uniqueEmployeesProcessed = createLayoverData.Select(x => x.IGA).Distinct().Count();
+
+                    _logger.LogInformation($"🏆 PROCESSING COMPLETE - Summary Report:");
+                    _logger.LogInformation($"   📊 Total Employees Processed: {uniqueEmployeesProcessed:N0}");
+                    _logger.LogInformation($"   📋 Total Layover Records Created: {totalRecordsCreated:N0}");
+                    _logger.LogInformation($"   ⏱️  Total Processing Time: {overallDuration:F2} minutes");
+                    _logger.LogInformation($"   🚀 Average Processing Rate: {uniqueEmployeesProcessed / overallDuration:F2} employees/minute");
+                    _logger.LogInformation($"   💾 Final Memory Usage: {finalMemoryMB:F0}MB");
+                    _logger.LogInformation($"   ✅ Successful Batches: {successfulBatches}/{totalBatches}");
                 }
             }
             catch (Exception ex)
@@ -841,63 +856,85 @@ namespace Clob.AC.Application.Services
             try
             {
                 var batchStartTime = DateTime.Now;
-                _logger.LogInformation($"Batch {batchNumber}: Starting processing of {batchEmplst.Count} crew members at {batchStartTime.TimeOfDay}");
+                var currentMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
+                
+                _logger.LogInformation($"📦 Batch {batchNumber}: Starting processing of {batchEmplst.Count} crew members " +
+                                     $"at {batchStartTime:HH:mm:ss.fff} (Memory: {currentMemoryMB}MB)");
 
                 // Validate input parameters
                 if (batchEmplst == null || !batchEmplst.Any())
                 {
-                    _logger.LogWarning($"Batch {batchNumber}: Empty or null batch list provided");
+                    _logger.LogWarning($"⚠️  Batch {batchNumber}: Empty or null batch list provided");
                     return;
                 }
 
                 if (crewInformation == null)
                 {
-                    _logger.LogWarning($"Batch {batchNumber}: Crew information is null");
+                    _logger.LogWarning($"⚠️  Batch {batchNumber}: Crew information is null");
                     return;
                 }
 
                 // Load crew layover data for this batch with error handling
                 List<CrewLayoverRoaster> crewLayoverData = null;
+                var dataLoadStartTime = DateTime.Now;
+                
                 try
                 {
                     crewLayoverData = await LoadCrewLayoverDataBatch(batchEmplst, fromDate, toDate);
+                    var dataLoadDuration = (DateTime.Now - dataLoadStartTime).TotalMilliseconds;
+                    _logger.LogDebug($"📊 Batch {batchNumber}: Loaded {crewLayoverData?.Count ?? 0} crew layover records in {dataLoadDuration:F2}ms");
                 }
                 catch (TimeoutException tex)
                 {
-                    _logger.LogError(tex, $"Batch {batchNumber}: Timeout occurred while loading crew layover data");
+                    var dataLoadDuration = (DateTime.Now - dataLoadStartTime).TotalMilliseconds;
+                    _logger.LogError(tex, $"⏰ Batch {batchNumber}: Timeout occurred while loading crew layover data after {dataLoadDuration:F2}ms");
                     return; // Skip this batch and continue with others
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, $"Batch {batchNumber}: Error loading crew layover data");
+                    var dataLoadDuration = (DateTime.Now - dataLoadStartTime).TotalMilliseconds;
+                    _logger.LogError(ex, $"❌ Batch {batchNumber}: Error loading crew layover data after {dataLoadDuration:F2}ms");
                     return; // Skip this batch and continue with others
                 }
 
                 if (crewLayoverData != null && crewLayoverData.Count > 0)
                 {
+                    var processingStartTime = DateTime.Now;
                     try
                     {
                         // Process crews in this batch in parallel
                         await ProcessCrewLayoverDataParallel(crewLayoverData, crewInformation, layOverfromDate, categoryIds);
-                        _logger.LogInformation($"Batch {batchNumber}: Successfully processed {crewLayoverData.Count} layover records");
+                        
+                        var processingDuration = (DateTime.Now - processingStartTime).TotalMilliseconds;
+                        var uniqueEmployees = crewLayoverData.Select(x => x.EmpNo).Distinct().Count();
+                        
+                        _logger.LogInformation($"✅ Batch {batchNumber}: Successfully processed {uniqueEmployees} employees " +
+                                             $"with {crewLayoverData.Count} layover records in {processingDuration:F2}ms " +
+                                             $"(Avg: {processingDuration / uniqueEmployees:F2}ms/employee)");
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, $"Batch {batchNumber}: Error processing crew layover data");
+                        var processingDuration = (DateTime.Now - processingStartTime).TotalMilliseconds;
+                        _logger.LogError(ex, $"❌ Batch {batchNumber}: Error processing crew layover data after {processingDuration:F2}ms");
                         // Don't rethrow - let other batches continue processing
                     }
                 }
                 else
                 {
-                    _logger.LogInformation($"Batch {batchNumber}: No layover data found for processing");
+                    _logger.LogInformation($"📭 Batch {batchNumber}: No layover data found for processing");
                 }
 
-                var processingTime = (DateTime.Now - batchStartTime).TotalSeconds;
-                _logger.LogInformation($"Batch {batchNumber}: Completed processing in {processingTime} seconds");
+                var totalBatchTime = (DateTime.Now - batchStartTime).TotalMilliseconds;
+                var finalMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
+                var memoryDelta = finalMemoryMB - currentMemoryMB;
+                
+                _logger.LogInformation($"🏁 Batch {batchNumber}: Completed in {totalBatchTime:F2}ms " +
+                                     $"(Memory: {finalMemoryMB}MB, Δ{memoryDelta:+0;-0}MB)");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Batch {batchNumber}: Unexpected error in ProcessCrewBatchAsync");
+                var batchDuration = (DateTime.Now - batchStartTime).TotalMilliseconds;
+                _logger.LogError(ex, $"💥 Batch {batchNumber}: Unexpected error after {batchDuration:F2}ms - {ex.Message}");
                 // Don't rethrow to prevent terminating the entire process
             }
             finally
@@ -908,7 +945,7 @@ namespace Clob.AC.Application.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, $"Batch {batchNumber}: Error releasing semaphore");
+                    _logger.LogError(ex, $"🔐 Batch {batchNumber}: Error releasing semaphore - {ex.Message}");
                 }
             }
         }
@@ -918,17 +955,43 @@ namespace Clob.AC.Application.Services
         {
             var grouped = crewLayoverData.GroupBy(f => f.EmpNo);
             var crewInformationLookup = crewInformationData.ToDictionary(x => x.EmpNo, x => x);
+            var totalEmployees = grouped.Count();
+
+            _logger.LogInformation($"Starting parallel processing of {totalEmployees} employees");
 
             // Process each crew member in parallel within the batch
-            var crewTasks = grouped.Select(async group =>
+            var crewTasks = grouped.Select(async (group, index) =>
             {
                 if (crewInformationLookup.TryGetValue(group.Key, out var crewInfo))
                 {
-                    await CalculateLayoverHoursOptimized(group, crewInfo, categoryIds, layOverfromDate);
+                    var employeeStartTime = DateTime.Now;
+                    var employeeName = BuildCrewName(crewInfo);
+                    var flightCount = group.Count();
+
+                    _logger.LogInformation($"[{index + 1}/{totalEmployees}] Processing Employee: {group.Key} ({employeeName}) with {flightCount} flights");
+
+                    try
+                    {
+                        await CalculateLayoverHoursOptimized(group, crewInfo, categoryIds, layOverfromDate);
+                        
+                        var processingDuration = (DateTime.Now - employeeStartTime).TotalMilliseconds;
+                        _logger.LogInformation($"[{index + 1}/{totalEmployees}] ✅ Completed Employee: {group.Key} ({employeeName}) in {processingDuration:F2}ms");
+                    }
+                    catch (Exception ex)
+                    {
+                        var processingDuration = (DateTime.Now - employeeStartTime).TotalMilliseconds;
+                        _logger.LogError(ex, $"[{index + 1}/{totalEmployees}] ❌ Failed Employee: {group.Key} ({employeeName}) after {processingDuration:F2}ms - {ex.Message}");
+                        throw; // Re-throw to maintain error handling
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning($"[{index + 1}/{totalEmployees}] ⚠️  Employee {group.Key} not found in crew information lookup");
                 }
             });
 
             await Task.WhenAll(crewTasks);
+            _logger.LogInformation($"Completed parallel processing of {totalEmployees} employees");
         }
 
         private async Task CalculateLayoverHoursOptimized(IGrouping<long, CrewLayoverRoaster> crewLayoverData, CrewDetailDto crewInfo, List<int> categoryIds, DateTime layOverfromDate)
@@ -938,6 +1001,8 @@ namespace Clob.AC.Application.Services
 
         private void CalculateLayoverHoursSynchronous(IGrouping<long, CrewLayoverRoaster> crewLayoverData, CrewDetailDto crewInfo, List<int> categoryIds, DateTime layOverfromDate)
         {
+            var employeeProcessingStart = DateTime.Now;
+            
             // Cache DateTime.UtcNow once for this crew member processing
             _cachedUtcNow = DateTime.UtcNow;
 
@@ -950,6 +1015,8 @@ namespace Clob.AC.Application.Services
             var passportExpiry = crewInfo?.PassportExpiry;
             var crewCategory = string.Join(",", categoryIds.Distinct());
 
+            _logger.LogDebug($"🔄 Processing Employee {IGA} ({crewName}) - Rank: {crewRank}, Category: {crewCategory}");
+
             // Pre-compute meal lookup sets once per crew member
             var mealCrewRankIds = MealCrewRankLookup.TryGetValue(crewRank, out var rankIds) ? rankIds : new HashSet<int>();
             var mealCategoryIds = GetMealCategoryIds(categoryIds);
@@ -958,30 +1025,63 @@ namespace Clob.AC.Application.Services
             var allCrewFlights = crewLayoverData.OrderBy(f => f.Std).ToArray(); // Use array for better performance
             var crewFlights = FilterCrewFlights(allCrewFlights, layOverfromDate, out bool previousMonthRecordAdded);
 
+            _logger.LogDebug($"📋 Employee {IGA} ({crewName}) has {crewFlights.Length} flights to process (filtered from {allCrewFlights.Length})");
+
+            int layoverRecordsCreated = 0;
+            int layoverRecordsSkipped = 0;
+            decimal totalLayoverAllowance = 0;
+            decimal totalMealAllowance = 0;
+
             // Process each flight segment
             for (int i = 0; i < crewFlights.Length; i++)
             {
+                var flightProcessingStart = DateTime.Now;
                 var current = crewFlights[i];
                 var next = i == crewFlights.Length - 1 ? null : crewFlights[i + 1];
 
                 // Skip duplicates early
-                if (IsDuplicateRecord(current, next)) continue;
+                if (IsDuplicateRecord(current, next)) 
+                {
+                    layoverRecordsSkipped++;
+                    _logger.LogTrace($"⏭️  Employee {IGA} Flight {i + 1}: Skipped duplicate record");
+                    continue;
+                }
 
                 var currentStay = current.Arr?.Trim() ?? "";
-                if (string.IsNullOrEmpty(currentStay)) continue;
+                if (string.IsNullOrEmpty(currentStay)) 
+                {
+                    layoverRecordsSkipped++;
+                    _logger.LogTrace($"⏭️  Employee {IGA} Flight {i + 1}: Skipped - no arrival station");
+                    continue;
+                }
 
                 // Get station data with O(1) lookup
-                if (!StationMasterLookup.TryGetValue(currentStay, out var stationData)) continue;
+                if (!StationMasterLookup.TryGetValue(currentStay, out var stationData)) 
+                {
+                    layoverRecordsSkipped++;
+                    _logger.LogTrace($"⏭️  Employee {IGA} Flight {i + 1}: Skipped - station {currentStay} not found in master data");
+                    continue;
+                }
 
                 // Calculate layover timing
                 var (stayStart, stayEnd, layoverStayHours, layoverStayMinutes, isActualData) =
                     CalculateLayoverTiming(current, next, _currentDateTime);
 
                 // Skip if no layover or missing required data
-                if (!HasValidFlightData(current, next, i, previousMonthRecordAdded)) continue;
+                if (!HasValidFlightData(current, next, i, previousMonthRecordAdded)) 
+                {
+                    layoverRecordsSkipped++;
+                    _logger.LogTrace($"⏭️  Employee {IGA} Flight {i + 1}: Skipped - invalid flight data");
+                    continue;
+                }
 
                 var isCrewBase = IsCrewAtBase(currentStay, current.CrewBase);
-                if (isCrewBase) continue; // Skip if crew is at base
+                if (isCrewBase) 
+                {
+                    layoverRecordsSkipped++;
+                    _logger.LogTrace($"⏭️  Employee {IGA} Flight {i + 1}: Skipped - crew at base station {currentStay}");
+                    continue; // Skip if crew is at base
+                }
 
                 // Calculate allowances efficiently
                 var (layoverAllowance, mealAllowance, restaurant) = CalculateAllowancesOptimized(
@@ -1006,7 +1106,26 @@ namespace Clob.AC.Application.Services
                 mealReport.MealAllowance = finalMealAllowance;
 
                 CreateLayoverDataOptimized(layoverDataRecord, layoverReport, mealReport);
+
+                // Track totals for logging
+                layoverRecordsCreated++;
+                totalLayoverAllowance += finalLayoverAllowance;
+                totalMealAllowance += finalMealAllowance;
+
+                var flightProcessingDuration = (DateTime.Now - flightProcessingStart).TotalMilliseconds;
+                
+                _logger.LogTrace($"✈️  Employee {IGA} Flight {i + 1}: {current.Dep} → {currentStay} " +
+                                $"({layoverStayHours}h {layoverStayMinutes}m) " +
+                                $"Layover: {finalLayoverAllowance:C} {currency}, Meal: {finalMealAllowance:C} {currency} " +
+                                $"[{flightProcessingDuration:F1}ms]");
             }
+
+            var totalProcessingDuration = (DateTime.Now - employeeProcessingStart).TotalMilliseconds;
+            
+            _logger.LogInformation($"💰 Employee {IGA} ({crewName}) Summary: " +
+                                 $"Created: {layoverRecordsCreated}, Skipped: {layoverRecordsSkipped}, " +
+                                 $"Total Layover: {totalLayoverAllowance:C}, Total Meal: {totalMealAllowance:C}, " +
+                                 $"Processing Time: {totalProcessingDuration:F2}ms");
         }
 
         private static string BuildCrewName(CrewDetailDto crewInfo)
@@ -1270,8 +1389,11 @@ namespace Clob.AC.Application.Services
         private async Task SaveLayoverDataBulk(RosterResponse rosterResponse)
         {
             var transactionTime = DateTime.Now;
-            Console.WriteLine($"Bulk save transaction begin at {transactionTime.TimeOfDay}");
-            Console.WriteLine($"Total layover records to save: {createLayoverData.Count}");
+            var initialMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
+            
+            _logger.LogInformation($"💾 Bulk save transaction starting at {transactionTime:HH:mm:ss.fff} " +
+                                 $"(Memory: {initialMemoryMB}MB)");
+            _logger.LogInformation($"📊 Total layover records to save: {createLayoverData.Count}");
 
             // Create local scope and DbContext for bulk save operations to avoid concurrency issues
             using var scope = _serviceProvider.CreateScope();
@@ -1283,10 +1405,13 @@ namespace Clob.AC.Application.Services
                 var existingDataList = existingLayoverData.ToList();
                 var createDataList = createLayoverData.ToList();
 
+                _logger.LogInformation($"📈 Processing Summary: {createDataList.Count} new records, {existingDataList.Count} existing records to clean up");
+
                 // Delete existing records in bulk
                 if (existingDataList.Any())
                 {
-                    Console.WriteLine($"Deleting {existingDataList.Count} existing records...");
+                    var deleteStartTime = DateTime.Now;
+                    _logger.LogInformation($"🗑️  Deleting {existingDataList.Count} existing records...");
 
                     var existingCrewMeals = existingDataList
                         .Where(p => p.CrewMealReport != null)
@@ -1299,22 +1424,36 @@ namespace Clob.AC.Application.Services
                         .ToList();
 
                     if (existingCrewMeals.Any())
+                    {
                         await localDbContext.CrewMealReportV2.BulkDeleteAsync(existingCrewMeals);
+                        _logger.LogDebug($"🍽️  Deleted {existingCrewMeals.Count} existing crew meal reports");
+                    }
 
                     if (existingLayoverReport.Any())
+                    {
                         await localDbContext.InternationalLayoverReport.BulkDeleteAsync(existingLayoverReport);
+                        _logger.LogDebug($"✈️  Deleted {existingLayoverReport.Count} existing layover reports");
+                    }
 
                     await localDbContext.LayoverDataV2.BulkDeleteAsync(existingDataList);
+                    
+                    var deleteDuration = (DateTime.Now - deleteStartTime).TotalMilliseconds;
+                    _logger.LogInformation($"✅ Deletion completed in {deleteDuration:F2}ms");
                 }
 
                 // Insert new records in bulk
                 if (createDataList.Any())
                 {
-                    Console.WriteLine($"Inserting {createDataList.Count} new records...");
+                    var insertStartTime = DateTime.Now;
+                    _logger.LogInformation($"➕ Inserting {createDataList.Count} new records...");
 
+                    // Insert main layover data
                     await localDbContext.LayoverDataV2.BulkInsertAsync(createDataList);
+                    var mainInsertDuration = (DateTime.Now - insertStartTime).TotalMilliseconds;
+                    _logger.LogDebug($"📋 Main layover data inserted in {mainInsertDuration:F2}ms");
 
                     // Update foreign keys for related entities
+                    var foreignKeyStartTime = DateTime.Now;
                     createDataList
                         .Where(e => e.CrewMealReport != null)
                         .ToList()
@@ -1325,6 +1464,10 @@ namespace Clob.AC.Application.Services
                         .ToList()
                         .ForEach(e => e.LayoverReport.LayoverDataId = e.Id);
 
+                    var foreignKeyDuration = (DateTime.Now - foreignKeyStartTime).TotalMilliseconds;
+                    _logger.LogDebug($"🔗 Foreign key updates completed in {foreignKeyDuration:F2}ms");
+
+                    // Insert related entities
                     var entityCrewMeals = createDataList
                         .Where(p => p.CrewMealReport != null)
                         .Select(p => p.CrewMealReport)
@@ -1335,24 +1478,66 @@ namespace Clob.AC.Application.Services
                         .Select(p => p.LayoverReport)
                         .ToList();
 
+                    var relatedInsertStartTime = DateTime.Now;
                     if (entityCrewMeals.Any())
+                    {
                         await localDbContext.CrewMealReportV2.BulkInsertAsync(entityCrewMeals);
+                        _logger.LogDebug($"🍽️  Inserted {entityCrewMeals.Count} crew meal reports");
+                    }
 
                     if (entityLayoverReport.Any())
+                    {
                         await localDbContext.InternationalLayoverReport.BulkInsertAsync(entityLayoverReport);
+                        _logger.LogDebug($"✈️  Inserted {entityLayoverReport.Count} layover reports");
+                    }
 
+                    var relatedInsertDuration = (DateTime.Now - relatedInsertStartTime).TotalMilliseconds;
+                    _logger.LogDebug($"📎 Related entities inserted in {relatedInsertDuration:F2}ms");
+
+                    // Save changes
+                    var saveStartTime = DateTime.Now;
                     await localDbContext.SaveChangesAsync();
+                    var saveDuration = (DateTime.Now - saveStartTime).TotalMilliseconds;
+                    _logger.LogDebug($"💾 SaveChanges completed in {saveDuration:F2}ms");
+
+                    var totalInsertDuration = (DateTime.Now - insertStartTime).TotalMilliseconds;
+                    _logger.LogInformation($"✅ All insertions completed in {totalInsertDuration:F2}ms");
 
                     rosterResponse.Status = true;
                     rosterResponse.RowsInserted += createDataList.Count;
+
+                    // Log employee processing statistics
+                    var uniqueEmployees = createDataList.Select(x => x.IGA).Distinct().Count();
+                    var totalAllowances = createDataList.Sum(x => (decimal?)(x.LayoverReport?.Allowance + x.CrewMealReport?.MealAllowance) ?? 0);
+                    
+                    _logger.LogInformation($"💰 Financial Summary: {uniqueEmployees} employees processed, " +
+                                         $"Total Allowances: {totalAllowances:C}, " +
+                                         $"Average per Employee: {(totalAllowances / uniqueEmployees):C}");
                 }
 
                 transaction.Commit();
-                Console.WriteLine($"Bulk save completed in {(DateTime.Now - transactionTime).TotalSeconds} seconds");
+                
+                var finalMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
+                var memoryDelta = finalMemoryMB - initialMemoryMB;
+                var totalTransactionTime = (DateTime.Now - transactionTime).TotalMilliseconds;
+                
+                _logger.LogInformation($"🎉 Bulk save transaction completed successfully in {totalTransactionTime:F2}ms " +
+                                     $"(Memory: {finalMemoryMB}MB, Δ{memoryDelta:+0;-0}MB)");
             }
             catch (Exception ex)
             {
-                transaction.Rollback();
+                var errorTime = (DateTime.Now - transactionTime).TotalMilliseconds;
+                _logger.LogError(ex, $"💥 Bulk save transaction failed after {errorTime:F2}ms - {ex.Message}");
+                
+                try
+                {
+                    transaction.Rollback();
+                    _logger.LogInformation($"🔄 Transaction rollback completed");
+                }
+                catch (Exception rollbackEx)
+                {
+                    _logger.LogError(rollbackEx, $"❌ Transaction rollback failed - {rollbackEx.Message}");
+                }
                 throw;
             }
         }
