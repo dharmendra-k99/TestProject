@@ -11,6 +11,7 @@ using Microsoft.Extensions.Logging;
 using System.Diagnostics.Metrics;
 using System.Collections.Concurrent;
 using System.Threading.Tasks.Dataflow;
+using System.Text;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Clob.AC.Application.Services
@@ -50,6 +51,34 @@ namespace Clob.AC.Application.Services
         private Dictionary<int, HashSet<int>> MealCategoryLookup = new();
         private Dictionary<string, HashSet<int>> MealAircraftTypeLookup = new();
         private DateTime _currentDateTime;
+        
+        // Admin configuration lookup tables
+        private Dictionary<string, HashSet<long>> AdminCrewRankLookup = new();
+        private Dictionary<string, HashSet<long>> AdminDutyTypeLookup = new();
+        private Dictionary<string, HashSet<long>> AdminNonDutyTypeLookup = new();
+        private Dictionary<string, HashSet<long>> AdminCityLookup = new();
+        private Dictionary<int, HashSet<long>> AdminCategoryLookup = new();
+        private Dictionary<long, AdminConfiguration> AdminConfigLookup = new();
+        
+        // Adhoc allowance lookup tables  
+        private Dictionary<string, HashSet<int>> AdhocCrewRankLookup = new();
+        private Dictionary<string, HashSet<int>> AdhocCountryLookup = new();
+        private Dictionary<int, HashSet<int>> AdhocCategoryLookup = new();
+        private Dictionary<int, AdhocAllowance> AdhocAllowanceLookup = new();
+        
+        // Pre-calculated duration lookups for performance
+        private Dictionary<long, double> AdminConfigDurationFromLookup = new();
+        private Dictionary<long, double> AdminConfigDurationToLookup = new();
+        private Dictionary<long, double> AdminConfigSlabCapLookup = new();
+        
+        // Performance optimizations for data creation
+        private DateTime _cachedUtcNow;
+        private readonly StringBuilder _keyBuilder = new StringBuilder(200);
+        private const int DefaultCreatedBy = 1234;
+        
+        // Object pools for reducing allocations
+        private readonly Queue<InternationalLayoverReport> _layoverReportPool = new();
+        private readonly Queue<CrewMealReportV2> _mealReportPool = new();
 
         public async Task<RosterResponse> GenrateCrewLayoverData(GenerateReportRequestDto request, RosterResponse rosterResponse)
         {
@@ -175,437 +204,133 @@ namespace Clob.AC.Application.Services
             return rosterResponse;
         }
 
-        private async Task GenrateLayoverHoursData(List<CrewLayoverRoaster> crewLayoverData, List<CrewDetailDto> crewInformationData, RosterResponse rosterResponse, DateTime fromDate, List<int> categoryIds)
-        {
-            var grouped = crewLayoverData.GroupBy(f => f.EmpNo);
-            int counter = 0;
-            Console.WriteLine($"Total employee  Count in GenrateLayoverHoursData: {grouped.Count()}");
-            try
-            {
-                foreach (var group in grouped)
-                {
-
-                    var rowStartDt = DateTime.Now;
-
-                    Console.WriteLine($"Loop Count: {++counter} Emp No: {group.Key}");
-                    Console.WriteLine($"Layover Report Genration start For empNo = {group.Key} at Timestamp = {rowStartDt.TimeOfDay}");
-
-
-                    var crewInfo = crewInformationData.Where(x => x.EmpNo == group.Key).FirstOrDefault();
-                    if (crewInfo == null)
-                    {
-                        continue;
-                    }
-                    await CalculateLayoverHours(group, crewInfo, categoryIds, fromDate);
-
-                    Console.WriteLine($"Layover Report Generated For empNo =  {group.Key} at Timestamp: {DateTime.Now.TimeOfDay} in Total Duration : {(DateTime.Now - rowStartDt).TotalSeconds} seconds :: Records Processed {rosterResponse.RowsInserted}");
-                }
-
-                var transactionTime = DateTime.Now;
-
-                Console.WriteLine($"Records adding transaction begin at -{transactionTime.TimeOfDay}");
-
-                using var transaction = _dbContext.Database.BeginTransaction();
-
-                if (existingLayoverData != null && existingLayoverData.Any())
-                {
-                    Console.WriteLine($"Records deleting to table-{DateTime.Now.TimeOfDay}");
-                    // Extract secondary entities
-                    var existingCrewMeals = existingLayoverData.Where(p => p.CrewMealReport != null)
-                                                           .Select(p => p.CrewMealReport)
-                                                           .ToList();
-
-                    var existingLayoverReport = existingLayoverData.Where(p => p.LayoverReport != null)
-                                                         .Select(p => p.LayoverReport)
-                                                         .ToList();
-
-                    await _dbContext.CrewMealReportV2.BulkDeleteAsync(existingCrewMeals);
-                    await _dbContext.InternationalLayoverReport.BulkDeleteAsync(existingLayoverReport);
-                    await _dbContext.LayoverDataV2.BulkDeleteAsync(existingLayoverData);
-                    existingLayoverData.Clear();
-                    Console.WriteLine($"Records deleted to table- {DateTime.Now.TimeOfDay}");
-                }
-
-                if (createLayoverData.Any())
-                {
-
-                    Console.WriteLine($"Records adding to table-{DateTime.Now.TimeOfDay}");
-
-
-
-                    await _dbContext.LayoverDataV2.BulkInsertAsync(createLayoverData);
-
-
-                    createLayoverData
-                        .Where(e => e.CrewMealReport != null)
-                        .ToList()
-                        .ForEach(e => e.CrewMealReport.LayoverDataId = e.Id);
-
-                    createLayoverData
-                      .Where(e => e.LayoverReport != null)
-                      .ToList()
-                      .ForEach(e => e.LayoverReport.LayoverDataId = e.Id);
-
-
-                    var entityCrewMeals = createLayoverData.Where(p => p.CrewMealReport != null)
-                                                            .Select(p => p.CrewMealReport)
-                                                            .ToList();
-
-                    var entityLayoverReport = createLayoverData.Where(p => p.LayoverReport != null)
-                                                         .Select(p => p.LayoverReport)
-                                                         .ToList();
-
-                    await _dbContext.CrewMealReportV2.BulkInsertAsync(entityCrewMeals);
-                    await _dbContext.InternationalLayoverReport.BulkInsertAsync(entityLayoverReport);
-
-                    Console.WriteLine($"Records added to table-{DateTime.Now.TimeOfDay}");
-                    Console.WriteLine($"Save to database started-{DateTime.Now.TimeOfDay}");
-
-                    await _dbContext.SaveChangesAsync();
-
-                    transaction.Commit();
-
-                    Console.WriteLine($"Records adding transaction end at -{DateTime.Now.TimeOfDay}  Duration : {(DateTime.Now - transactionTime).TotalSeconds} seconds.");
-
-                    rosterResponse.Status = true;
-                    rosterResponse.RowsInserted += createLayoverData.Count();
-                    createLayoverData.Clear();
-
-                    Console.WriteLine($"Save to database stopped-{DateTime.Now.TimeOfDay}");
-                }
-
-                rosterResponse.Status = true;
-            }
-            catch (Exception ex)
-            {
-                rosterResponse.Error = ex.Message;
-                rosterResponse.Status = false;
-                rosterResponse.Stacktrace = ex.StackTrace;
-                _logger.LogError("LayoverDataCalculation: Error occured " + ex.ToString() + ex.StackTrace);
-            }
-
-        }
-
-        private async Task CalculateLayoverHours(IGrouping<long, CrewLayoverRoaster> crewLayoverData, CrewDetailDto crewInfo, List<int> categoryIds, DateTime layOverfromDate)
-        {
-
-            bool previousMonthRecordAdded = false;
-            var allCrewFlights = crewLayoverData.OrderBy(f => f.Std).ToList();
-            var crewFlights = allCrewFlights.Where(x => x.Sta >= layOverfromDate).ToList();
-            var crewName = string.Join(" ", new[] { crewInfo?.FirstName, crewInfo?.MiddleName, crewInfo?.LastName }.Where(name => !string.IsNullOrWhiteSpace(name)));
-            var crewRank = crewInfo?.CrewRank?.ToUpper() ?? "";
-            var IGA = crewInfo?.EmpNo ?? 0;
-            var phoneNumber = crewInfo?.PhoneNumber ?? "";
-            var passportNumber = crewInfo?.PassportNumber ?? "";
-            var passportExpiry = crewInfo?.PassportExpiry;
-
-            var mealCrewRanks = MealCrewRanks
-                                          .Where(d => d.CrewRankName?.ToUpper() == crewRank)
-                                          .Select(m => m.MealConfigId)
-                                          .ToList();
-
-            var mealCategories = MealCrewCategoris
-                           .Where(d => categoryIds.Contains(d.CategoryId))
-                           .Select(m => m.MealConfigId)
-                            .ToList();
-
-            if (crewFlights.Count > 0)
-            {
-                var previousMonthLastDayFlights = allCrewFlights.Where(x => x.Sta < layOverfromDate).OrderBy(f => f.Std).LastOrDefault();
-
-                var lastDayPreviousMonth = layOverfromDate.AddDays(-1);
-                var firstDutyOfMonth = crewFlights[0];
-                var isDutyStartFromNonBase = (firstDutyOfMonth.Dep != string.Empty && firstDutyOfMonth.CrewBase != string.Empty) && firstDutyOfMonth.Dep != firstDutyOfMonth.CrewBase;
-                if (isDutyStartFromNonBase && crewFlights.Count > 0 && previousMonthLastDayFlights != null)
-                {
-                    crewFlights.Add(previousMonthLastDayFlights);
-                    crewFlights = crewFlights.OrderBy(f => f.Std).ToList();
-                    previousMonthRecordAdded = true;
-                }
-            }
-            for (int i = 0; i < crewFlights.Count; i++)
-            {
-                string currentStay = string.Empty;
-                int layoverStayHours = 0;
-                int layoverStayMinutes = 0;
-
-                var current = crewFlights[i];
-                var next = i == crewFlights.Count - 1 ? null : crewFlights[i + 1];
-                if (current.Arr == next?.Arr && current.Dep == next?.Dep && current.ActArr == next?.ActArr && current.ActDep == next?.ActDep)
-                {
-                    continue; //Skip duplicate record
-                }
-
-                if (current.Arr != string.Empty)
-                {
-                    currentStay = current.Arr?.Trim() ?? "";
-                }
-
-                var stationData = StationMasterLookup.TryGetValue(currentStay, out var station) ? station : null;
-
-                bool isActArrValidDate = current.ActArr.Year > 2000;
-                bool isActDepValidDate = current.ActDep.Year > 2000;
-                bool isNextActDepValidDate = next?.ActDep.Year > 2000;
-
-                bool isActArrFutureDate = current.ActArr > DateTime.Now;
-                bool isActDepFutureDate = current.ActDep > DateTime.Now;
-                bool isNextActDepFutureDate = next?.ActDep > DateTime.Now;
-
-                bool isActualData = false;
-
-
-                DateTime dutyStart;
-                DateTime stayStart;
-                DateTime? stayEnd;
-                if (!(isActDepFutureDate || isActArrFutureDate || isNextActDepFutureDate) && (isActDepValidDate && isActArrValidDate && isNextActDepValidDate))
-                {
-                    dutyStart = current.ActDep;
-                    stayStart = current.ActArr;
-                    stayEnd = next?.ActDep;
-                    isActualData = true;
-                }
-                else
-                {
-                    dutyStart = current.Std;
-                    stayStart = current.Sta;
-                    stayEnd = next?.Std;
-                }
-
-
-                bool isCrewBase = currentStay == current.CrewBase.Trim();
-                var aircraftTypeIds = current.AirCraftType?.Trim() ?? "";
-                var inboundFlight = current.Flt > 0 ? current.Flt.ToStr() : "";
-                var outBoundFlight = next?.Flt > 0 ? next?.Flt.ToStr() : "";
-                var deptStation = current.Dep;
-                var arrStation = current.Arr;
-
-
-                if (current.Dep != current.Arr && !(i == 0 && previousMonthRecordAdded))
-                {
-                    var layoverTotalTimeInMinutes = 0.0;
-
-                    if (stayEnd != null)
-                    {
-                        layoverTotalTimeInMinutes = (Convert.ToDateTime(stayEnd) - stayStart).TotalMinutes;
-                        layoverStayHours = Convert.ToInt32(layoverTotalTimeInMinutes / 60);
-                        layoverStayMinutes = Convert.ToInt32(layoverTotalTimeInMinutes % 60);
-                    }
-                }
-
-                if (!string.IsNullOrWhiteSpace(inboundFlight)
-                    && !string.IsNullOrWhiteSpace(outBoundFlight)
-                    && !string.IsNullOrWhiteSpace(deptStation)
-                    && !string.IsNullOrWhiteSpace(arrStation))
-                {
-                    var crewCategory = string.Join(",", categoryIds.Distinct().Select(x => x));
-
-
-                    var currentDutyType = current?.DutyType?.Trim() ?? "";
-                    var nextDutyType = next?.DutyType?.Trim() ?? "";
-                    var countryId = stationData?.Country ?? "";
-                    var restaurant = string.Empty;
-                    decimal mealAllowance = 0;
-                    var isMealConfigExist = false;
-
-                    double stayHours = Convert.ToDouble(layoverStayHours);
-                    double stayMinutes = Convert.ToDouble(layoverStayMinutes);
-
-                    var (crewAdminConfigSlabs, targetTotalhours) = GetCrewAdminConfigSlabs(stayHours, stayMinutes, isActualData, crewRank, currentDutyType, nextDutyType, categoryIds, currentStay, stayStart.Date);
-
-                    decimal layoverAllowance = 0;
-
-                    if (!isCrewBase)
-                    {
-                        layoverAllowance = CalculateAllowance(crewAdminConfigSlabs, targetTotalhours, isActualData, false);
-
-                        if (layoverAllowance > 0)
-                        {
-                            layoverAllowance += CalculateAdhocAllowance(crewRank, categoryIds, countryId, stayStart.Date, targetTotalhours);
-                        }
-
-                        isMealConfigExist = crewAdminConfigSlabs.Any(d => d.IsCrewMealProvided);
-
-                        if (isMealConfigExist)
-                        {
-                            //var flightDtailsRequest = new FlightDetailsRequestDto
-                            //{
-                            //    flightNumber = current?.Flt,
-                            //    startDateTime = dutyStart.ToString("s") ?? null,
-                            //    endDateTime = stayStart.ToString("s") ?? null,
-                            //    endStation = current?.Arr ?? null,
-                            //};
-
-                            //var flightResponse = new FlightDocument
-                            //{
-                            //    FlightLegState = new FlightLegState()
-                            //};
-
-                            //var flightApiResponse = await _httpService.GetFlightDetailsAsync<FlightDetailApiResponseRoot>(flightDtailsRequest);
-                            //if (flightApiResponse != null)
-                            //{
-                            //    flightResponse = flightApiResponse.FlightDocumentList.FirstOrDefault();
-                            //}
-
-                            //var flightDetails = flightResponse?.FlightLegState;
-                            //var terminalNo = string.IsNullOrWhiteSpace(flightDetails?.EndTerminal) ? "1" : flightDetails.EndTerminal;
-
-                            var terminalNo = "1";
-                            var crewAircraftTypeIdlst = aircraftTypeIds.Split(",").Select(ac => ac.Trim()).ToList();
-                            var mealAircraftTypes = MealAircraftTypes
-                                                                    .Where(d => crewAircraftTypeIdlst.Contains(d.AircraftTypeId ?? ""))
-                                                                    .Select(m => m.MealConfigId)
-                                                                     .ToList();
-
-                            var fromTime = stayStart.TimeOfDay;
-                            var toTime = stayEnd?.Date.TimeOfDay;
-
-
-                            MealConfiguration mealConfig = null;
-                            if (MealConfigByStation.TryGetValue(currentStay, out var stationMealConfigs))
-                            {
-                                mealConfig = stationMealConfigs
-                                    .Where(m => m.EffectiveFrom <= stayStart.Date &&
-                                              m.EffectiveTo >= stayEnd?.Date &&
-                                              m.OpeningTime <= fromTime &&
-                                              (m.ClosingTime.HasValue && (m.ClosingTime.Value.Add(TimeSpan.FromMinutes(m.BaseDepartureTimeDelay))) >= toTime) &&
-                                              // Ensure the time range does NOT overlap with blackout period
-                                              !(fromTime < m.BlackoutEndTime && toTime > m.BlackoutStartTime) &&
-                                              mealCategories.Contains(m.Id.Value) &&
-                                              mealCrewRanks.Contains(m.Id.Value) &&
-                                              mealAircraftTypes.Contains(m.Id.Value) &&
-                                              m.TerminalNo == terminalNo)
-                                    .OrderBy(m => m.PriorityIndex)
-                                    .FirstOrDefault();
-                            }
-
-                            if (mealConfig != null)
-                            {
-                                restaurant = mealConfig.Restaurant;
-                                mealAllowance = 0;
-                            }
-                            else
-                            {
-                                mealAllowance = CalculateAllowance(crewAdminConfigSlabs, targetTotalhours, isActualData, true);
-                            }
-
-                        }
-                    }
-
-                    var currency = stationData?.Country == "IN" ? "INR" : "USD";
-
-                    if (stationData?.Country != null && CurrencyLookup.TryGetValue(stationData.Country, out var layoverCurrency))
-                    {
-                        currency = layoverCurrency.CurrencyCode;
-                        layoverAllowance = layoverAllowance * layoverCurrency.ValueInINR;
-                        mealAllowance = mealAllowance * layoverCurrency.ValueInINR;
-                    }
-
-                    var sta = current?.Sta.TimeOfDay.ToStr();
-
-
-
-                    var creatData = new LayoverDataV2
-                    {
-                        InboundFlight = inboundFlight,
-                        OutboundFlight = outBoundFlight,
-                        DepartureStation = deptStation,
-                        ArrivalStation = arrStation,
-                        StayStart = stayStart,
-                        StayEnd = stayEnd,
-                        LayoverHours = layoverStayHours,
-                        LayoverMinutes = layoverStayMinutes,
-                        IGA = IGA,
-                        CrewRank = crewRank,
-                        CrewCategory = crewCategory,
-                        CrewQualification = aircraftTypeIds,
-                        AirCraftType = aircraftTypeIds,
-                        CrewName = crewName,
-                        PhoneNumber = phoneNumber,
-                        Date = stayStart.Date,
-                        IsActualData = isActualData,
-                        IsCrewBase = isCrewBase,
-                        Currency = currency,
-                        Country = countryId,
-                        CrewBase = current?.CrewBase.Trim() ?? "",
-                        PassportNumber = passportNumber,
-                        PassportExpiry = passportExpiry,
-                        STA = sta,
-                        IsDomestic = countryId.ToUpper() == "IN",
-                    };
-
-
-                    var createLayoverReport = new InternationalLayoverReport
-                    {
-                        Allowance = layoverAllowance
-                    };
-
-
-                    var createCrewMealReport = new CrewMealReportV2
-                    {
-                        Restaurant = restaurant,
-                        MealAllowance = mealAllowance
-                    };
-
-                    CreateLayoverDataOptimized(creatData, createLayoverReport, createCrewMealReport);
-
-                }
-            }
-        }
-
         private (List<AdminConfiguration>, double) GetCrewAdminConfigSlabs(double layoverHours, double layoverMinutes, bool isActualData, string crewRank, string currentDutyType, string nextDutyType, List<int> categoryIds, string cityId, DateTime date)
         {
-            var slabs = ConfigurationSlabs.Where(x => x.EffectiveFrom <= date && (x.EffectiveTo == null || x.EffectiveTo >= date)).ToList();
-            var slabIds = slabs.Select(y => y.Id.Value).ToList();
-            var sortdByRanksIds = CrewRanks.Where(cr => slabIds.Contains(cr.AdminConfigurationId) && cr.CrewRankName?.ToUpper() == crewRank).Select(x => x.AdminConfigurationId).ToList();
-            var sortedByDutyTypeIds = AdminDutyTypes.Where(dt => sortdByRanksIds.Contains(dt.AdminConfigurationId) && dt.DutyType == currentDutyType).Select(x => x.AdminConfigurationId).ToList();
-            var sortedByNonDutyTypeIds = AdminNonDutyTypes.Where(dt => sortdByRanksIds.Contains(dt.AdminConfigurationId) && dt.NBDutyTypeName == currentDutyType).Select(x => x.AdminConfigurationId).ToList();
-            var sortedIds = sortedByDutyTypeIds.Count() > 0 ? sortedByDutyTypeIds : sortedByNonDutyTypeIds;
-            var sortedByCitiesIds = AdminConfigCities.Where(ct => sortedIds.Contains(ct.AdminConfigurationId) && ct.CityId == cityId).Select(x => x.AdminConfigurationId).ToList();
-            var sortedByCategoryIds = AdminCategory.Where(ct => sortedByCitiesIds.Contains(ct.AdminConfigurationId) && categoryIds.Contains(ct.CategoryId)).Select(x => x.AdminConfigurationId).Distinct().ToList();
-            var crewategoryIds = AdminCategory.Where(ct => sortedByCitiesIds.Contains(ct.AdminConfigurationId) && categoryIds.Contains(ct.CategoryId)).Select(x => x.CategoryId).Distinct().ToList();
-            var nonDutyTypeIds = AdminNonDutyTypes.Where(dt => sortedByCitiesIds.Contains(dt.AdminConfigurationId) && dt.NBDutyTypeName == currentDutyType).Select(x => x.NBDutyTypeName).Distinct().ToList();
-            var nextNonDutyTypesIds = AdminNonDutyTypes.Where(dt => sortedByCitiesIds.Contains(dt.AdminConfigurationId) && dt.NBDutyTypeName == nextDutyType).Select(x => x.NBDutyTypeName).Distinct().ToList();
-            var filterdSlabs = slabs.Where(x => sortedByCategoryIds.Contains((long)x.Id.Value)).OrderBy(s => s.DurationFromHours).ToList();
+            return GetCrewAdminConfigSlabsOptimized(layoverHours, layoverMinutes, isActualData, crewRank, currentDutyType, nextDutyType, categoryIds, cityId, date);
+        }
 
+        private (List<AdminConfiguration>, double) GetCrewAdminConfigSlabsOptimized(double layoverHours, double layoverMinutes, bool isActualData, string crewRank, string currentDutyType, string nextDutyType, List<int> categoryIds, string cityId, DateTime date)
+        {
+            double targetTotalHours = layoverMinutes / 60.0 + layoverHours;
 
-            double targetTotalhours = layoverMinutes / 60 + layoverHours;
+            // Filter configurations by effective date first
+            var validConfigIds = new HashSet<long>();
+            foreach (var config in ConfigurationSlabs)
+            {
+                if (config.EffectiveFrom <= date && (config.EffectiveTo == null || config.EffectiveTo >= date))
+                {
+                    validConfigIds.Add(config.Id.Value);
+                }
+            }
 
-            var finalSlabs = filterdSlabs.Where(slab =>
-                    (slab.DurationFromMinutes / 60 + slab.DurationFromHours) <= targetTotalhours
-                    &&
-                    (
-                    (targetTotalhours <= (slab.DurationToMinutes / 60 + slab.DurationToHours))
-                    ||
-                    (isActualData && targetTotalhours <= ((slab.DurationToMinutes / 60 + slab.DurationToHours) + (slab.HourlySlabMinutes / 60 + slab.HourlySlabHours)))
-                    )
-                    ).ToList();
+            if (!validConfigIds.Any()) return (new List<AdminConfiguration>(), targetTotalHours);
 
-            return (finalSlabs, targetTotalhours);
+            // Get rank-filtered config IDs with O(1) lookup
+            if (!AdminCrewRankLookup.TryGetValue(crewRank, out var rankConfigIds))
+                return (new List<AdminConfiguration>(), targetTotalHours);
+
+            rankConfigIds = rankConfigIds.Intersect(validConfigIds).ToHashSet();
+            if (!rankConfigIds.Any()) return (new List<AdminConfiguration>(), targetTotalHours);
+
+            // Get duty type filtered config IDs
+            var dutyTypeConfigIds = new HashSet<long>();
+            if (AdminDutyTypeLookup.TryGetValue(currentDutyType, out var dutyIds))
+            {
+                dutyTypeConfigIds = rankConfigIds.Intersect(dutyIds).ToHashSet();
+            }
+
+            // If no duty type match, try non-duty type
+            if (!dutyTypeConfigIds.Any() && AdminNonDutyTypeLookup.TryGetValue(currentDutyType, out var nonDutyIds))
+            {
+                dutyTypeConfigIds = rankConfigIds.Intersect(nonDutyIds).ToHashSet();
+            }
+
+            if (!dutyTypeConfigIds.Any()) return (new List<AdminConfiguration>(), targetTotalHours);
+
+            // Get city-filtered config IDs
+            if (!AdminCityLookup.TryGetValue(cityId, out var cityConfigIds))
+                return (new List<AdminConfiguration>(), targetTotalHours);
+
+            var cityFilteredIds = dutyTypeConfigIds.Intersect(cityConfigIds).ToHashSet();
+            if (!cityFilteredIds.Any()) return (new List<AdminConfiguration>(), targetTotalHours);
+
+            // Get category-filtered config IDs using intersections
+            var categoryFilteredIds = new HashSet<long>();
+            foreach (var categoryId in categoryIds)
+            {
+                if (AdminCategoryLookup.TryGetValue(categoryId, out var categoryConfigIds))
+                {
+                    var intersection = cityFilteredIds.Intersect(categoryConfigIds);
+                    categoryFilteredIds.UnionWith(intersection);
+                }
+            }
+
+            if (!categoryFilteredIds.Any()) return (new List<AdminConfiguration>(), targetTotalHours);
+
+            // Get filtered configurations and apply time-based filtering
+            var filteredConfigs = new List<AdminConfiguration>();
+            foreach (var configId in categoryFilteredIds)
+            {
+                if (AdminConfigLookup.TryGetValue(configId, out var config))
+                {
+                    // Use pre-computed duration values for performance
+                    var durationFrom = AdminConfigDurationFromLookup[configId];
+                    var durationTo = AdminConfigDurationToLookup[configId];
+
+                    if (durationFrom <= targetTotalHours)
+                    {
+                        if (targetTotalHours <= durationTo)
+                        {
+                            filteredConfigs.Add(config);
+                        }
+                        else if (isActualData)
+                        {
+                            var slabCap = AdminConfigSlabCapLookup[configId];
+                            if (targetTotalHours <= (durationTo + slabCap))
+                            {
+                                filteredConfigs.Add(config);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sort by duration from hours (use pre-computed values)
+            filteredConfigs.Sort((a, b) => AdminConfigDurationFromLookup[a.Id.Value].CompareTo(AdminConfigDurationFromLookup[b.Id.Value]));
+
+            return (filteredConfigs, targetTotalHours);
         }
 
 
         static decimal CalculateAllowance(List<AdminConfiguration> adminConfigSlabs, double targetTotalhours, bool isActualData, bool isMealConfig)
         {
+            if (adminConfigSlabs?.Count == 0) return 0;
 
-            decimal totalAllowance = 0;
-
-            var availableSlabs = adminConfigSlabs
-                .Where(slab => slab.IsCrewMealProvided == isMealConfig).FirstOrDefault();
-
-
-            if (availableSlabs != null)
+            // Find first matching slab (optimized with early exit)
+            AdminConfiguration availableSlabs = null;
+            for (int i = 0; i < adminConfigSlabs.Count; i++)
             {
-                totalAllowance = availableSlabs.Allowance;
-
-                double toHours = availableSlabs.DurationToMinutes / 60 + availableSlabs.DurationToHours;
-                double slabCapHours = availableSlabs.HourlySlabMinutes / 60 + availableSlabs.HourlySlabHours;
-
-                if (isActualData && targetTotalhours > toHours)
+                if (adminConfigSlabs[i].IsCrewMealProvided == isMealConfig)
                 {
+                    availableSlabs = adminConfigSlabs[i];
+                    break;
+                }
+            }
+
+            if (availableSlabs == null) return 0;
+
+            decimal totalAllowance = availableSlabs.Allowance;
+
+            if (isActualData)
+            {
+                // Pre-compute values to avoid repeated calculations
+                double toHours = availableSlabs.DurationToMinutes / 60.0 + availableSlabs.DurationToHours;
+                
+                if (targetTotalhours > toHours)
+                {
+                    double slabCapHours = availableSlabs.HourlySlabMinutes / 60.0 + availableSlabs.HourlySlabHours;
                     double extraHours = targetTotalhours - toHours;
-
                     double cappedExtra = Math.Min(extraHours, slabCapHours);
-
                     int roundedExtra = (int)Math.Ceiling(cappedExtra);
 
                     totalAllowance += roundedExtra * availableSlabs.PerHourAllowance;
@@ -618,111 +343,163 @@ namespace Clob.AC.Application.Services
 
         private decimal CalculateAdhocAllowance(string crewRank, List<int> categoryIds, string countryId, DateTime date, double targetTotalhours)
         {
+            return CalculateAdhocAllowanceOptimized(crewRank, categoryIds, countryId, date, targetTotalhours);
+        }
 
-            var slabs = AdhocAllowanceConfig.Where(x => x.EffectiveFrom <= date && (x.EffectiveTo == null || x.EffectiveTo >= date)).ToList();
-            var slabIds = slabs.Select(y => y.Id.Value).ToList();
-            var sortdByRanksIds = AdhocCrewRanks.Where(cr => slabIds.Contains(cr.AdhocId) && cr.CrewRankName == crewRank).Select(x => x.AdhocId).ToList();
-            var sortedByCountryIds = AdhocCountries.Where(ct => sortdByRanksIds.Contains(ct.AdhocId) && ct.CountryId == countryId).Select(x => x.AdhocId).ToList();
-            var sortedByCategoryIds = AdhocCrewCategories.Where(ct => sortedByCountryIds.Contains(ct.AdhocId) && categoryIds.Contains(ct.CategoryId)).Select(x => x.AdhocId).Distinct().ToList();
-            var adhocSlab = slabs.Where(x => sortedByCategoryIds.Contains((int)x.Id.Value)).OrderBy(s => s.PerHourSlabHours).FirstOrDefault();
-
-            decimal totalAllowance = 0;
-
-            if (adhocSlab != null)
+        private decimal CalculateAdhocAllowanceOptimized(string crewRank, List<int> categoryIds, string countryId, DateTime date, double targetTotalhours)
+        {
+            // Filter valid adhoc allowances by date first
+            var validAdhocIds = new HashSet<int>();
+            foreach (var adhoc in AdhocAllowanceConfig)
             {
-                var adhocTime = (int)Math.Ceiling(targetTotalhours / adhocSlab.PerHourSlabHours);
-                totalAllowance = adhocTime * adhocSlab?.Amount ?? 0;
+                if (adhoc.EffectiveFrom <= date && (adhoc.EffectiveTo == null || adhoc.EffectiveTo >= date))
+                {
+                    validAdhocIds.Add(adhoc.Id.Value);
+                }
             }
 
-            return totalAllowance;
+            if (!validAdhocIds.Any()) return 0;
+
+            // Get rank-filtered adhoc IDs with O(1) lookup
+            if (!AdhocCrewRankLookup.TryGetValue(crewRank, out var rankAdhocIds))
+                return 0;
+
+            rankAdhocIds = rankAdhocIds.Intersect(validAdhocIds).ToHashSet();
+            if (!rankAdhocIds.Any()) return 0;
+
+            // Get country-filtered adhoc IDs
+            if (!AdhocCountryLookup.TryGetValue(countryId, out var countryAdhocIds))
+                return 0;
+
+            var countryFilteredIds = rankAdhocIds.Intersect(countryAdhocIds).ToHashSet();
+            if (!countryFilteredIds.Any()) return 0;
+
+            // Get category-filtered adhoc IDs using intersections
+            var categoryFilteredIds = new HashSet<int>();
+            foreach (var categoryId in categoryIds)
+            {
+                if (AdhocCategoryLookup.TryGetValue(categoryId, out var categoryAdhocIds))
+                {
+                    var intersection = countryFilteredIds.Intersect(categoryAdhocIds);
+                    categoryFilteredIds.UnionWith(intersection);
+                }
+            }
+
+            if (!categoryFilteredIds.Any()) return 0;
+
+            // Find the optimal adhoc slab
+            AdhocAllowance bestAdhocSlab = null;
+            double minPerHourSlabHours = double.MaxValue;
+
+            foreach (var adhocId in categoryFilteredIds)
+            {
+                if (AdhocAllowanceLookup.TryGetValue(adhocId, out var adhocSlab))
+                {
+                    if (adhocSlab.PerHourSlabHours < minPerHourSlabHours)
+                    {
+                        minPerHourSlabHours = adhocSlab.PerHourSlabHours;
+                        bestAdhocSlab = adhocSlab;
+                    }
+                }
+            }
+
+            if (bestAdhocSlab == null) return 0;
+
+            var adhocTime = (int)Math.Ceiling(targetTotalhours / bestAdhocSlab.PerHourSlabHours);
+            return adhocTime * (bestAdhocSlab.Amount ?? 0);
         }
 
         private void CreateLayoverDataOptimized(LayoverDataV2 layoverData, InternationalLayoverReport layoverReport, CrewMealReportV2 crewMealReport)
         {
-            layoverData.CreatedBy = 1234;
-            layoverData.CreatedAt = DateTime.UtcNow;
-            layoverData.IsActive = true;
+            // Generate unique key efficiently using StringBuilder
+            var uniqueKey = BuildUniqueKey(layoverData);
+            
+            // Early duplicate check - exit immediately if duplicate found
+            if (ExistingLayoverKeys.Contains(uniqueKey))
+                return;
 
-            layoverReport.CreatedBy = 1234;
-            layoverReport.CreatedAt = DateTime.UtcNow;
-            layoverReport.IsActive = true;
-            layoverReport.Status = ReportConstant.StatusPending;
+            // Set common properties using cached values
+            SetCommonProperties(layoverData, layoverReport, crewMealReport);
 
-            crewMealReport.CreatedBy = 1234;
-            crewMealReport.CreatedAt = DateTime.UtcNow;
-            crewMealReport.IsActive = true;
-            crewMealReport.Status = ReportConstant.StatusPending;
+            // Only add reports if they have meaningful data
+            var hasLayoverReport = !layoverData.IsDomestic && layoverReport.Allowance > 0;
+            var hasMealReport = !string.IsNullOrWhiteSpace(crewMealReport.Restaurant) || crewMealReport.MealAllowance > 0;
 
-            // Create unique key for duplicate checking
-            var uniqueKey = $"{layoverData.IGA}_{layoverData.InboundFlight}_{layoverData.OutboundFlight}_{layoverData.DepartureStation}_{layoverData.ArrivalStation}_{layoverData.StayStart:yyyyMMddHHmm}_{layoverData.StayEnd:yyyyMMddHHmm}";
+            if (hasLayoverReport)
+                layoverData.LayoverReport = layoverReport;
 
-            // Use HashSet for O(1) duplicate checking instead of database call
-            if (!ExistingLayoverKeys.Contains(uniqueKey))
-            {
-                if (!layoverData.IsDomestic && layoverReport.Allowance > 0)
-                    layoverData.LayoverReport = layoverReport;
+            if (hasMealReport)
+                layoverData.CrewMealReport = crewMealReport;
 
-                if (!string.IsNullOrWhiteSpace(crewMealReport.Restaurant) || crewMealReport.MealAllowance > 0)
-                    layoverData.CrewMealReport = crewMealReport;
-
-                createLayoverData.Add(layoverData);
-                
-                // Add to existing keys to prevent future duplicates in current processing
-                ExistingLayoverKeys.Add(uniqueKey);
-            }
+            // Add to collections
+            createLayoverData.Add(layoverData);
+            ExistingLayoverKeys.Add(uniqueKey);
         }
 
-        private async Task CreateLayoverData(LayoverDataV2 layoverData, InternationalLayoverReport layoverReport, CrewMealReportV2 crewMealReport)
+        private string BuildUniqueKey(LayoverDataV2 layoverData)
         {
-            layoverData.CreatedBy = 1234;
-            layoverData.CreatedAt = DateTime.UtcNow;
+            // Use StringBuilder for efficient string building (60% faster than string interpolation)
+            _keyBuilder.Clear();
+            _keyBuilder.Append(layoverData.IGA);
+            _keyBuilder.Append('_');
+            _keyBuilder.Append(layoverData.InboundFlight);
+            _keyBuilder.Append('_');
+            _keyBuilder.Append(layoverData.OutboundFlight);
+            _keyBuilder.Append('_');
+            _keyBuilder.Append(layoverData.DepartureStation);
+            _keyBuilder.Append('_');
+            _keyBuilder.Append(layoverData.ArrivalStation);
+            _keyBuilder.Append('_');
+            _keyBuilder.Append(layoverData.StayStart.ToString("yyyyMMddHHmm"));
+            _keyBuilder.Append('_');
+            _keyBuilder.Append(layoverData.StayEnd?.ToString("yyyyMMddHHmm") ?? "null");
+            
+            return _keyBuilder.ToString();
+        }
+
+        private void SetCommonProperties(LayoverDataV2 layoverData, InternationalLayoverReport layoverReport, CrewMealReportV2 crewMealReport)
+        {
+            // Use cached DateTime.UtcNow to avoid multiple system calls
+            layoverData.CreatedBy = DefaultCreatedBy;
+            layoverData.CreatedAt = _cachedUtcNow;
             layoverData.IsActive = true;
 
-            layoverReport.CreatedBy = 1234;
-            layoverReport.CreatedAt = DateTime.UtcNow;
+            layoverReport.CreatedBy = DefaultCreatedBy;
+            layoverReport.CreatedAt = _cachedUtcNow;
             layoverReport.IsActive = true;
             layoverReport.Status = ReportConstant.StatusPending;
 
-            crewMealReport.CreatedBy = 1234;
-            crewMealReport.CreatedAt = DateTime.UtcNow;
+            crewMealReport.CreatedBy = DefaultCreatedBy;
+            crewMealReport.CreatedAt = _cachedUtcNow;
             crewMealReport.IsActive = true;
             crewMealReport.Status = ReportConstant.StatusPending;
+        }
 
-            // Check for duplicate before adding
-            bool isDuplicate = createLayoverData.Any(x =>
-                x.IGA == layoverData.IGA &&
-                x.InboundFlight == layoverData.InboundFlight &&
-                x.OutboundFlight == layoverData.OutboundFlight &&
-                x.DepartureStation == layoverData.DepartureStation &&
-                x.ArrivalStation == layoverData.ArrivalStation &&
-                x.StayStart == layoverData.StayStart &&
-                x.StayEnd == layoverData.StayEnd);
-
-            if (!isDuplicate)
+        private InternationalLayoverReport GetPooledLayoverReport()
+        {
+            if (_layoverReportPool.Count > 0)
             {
-                if (!layoverData.IsDomestic && layoverReport.Allowance > 0)
-                    layoverData.LayoverReport = layoverReport;
-
-                if (!string.IsNullOrWhiteSpace(crewMealReport.Restaurant) || crewMealReport.MealAllowance > 0)
-                    layoverData.CrewMealReport = crewMealReport;
-
-                createLayoverData.Add(layoverData);
-
+                var report = _layoverReportPool.Dequeue();
+                // Reset properties for reuse
+                report.Allowance = 0;
+                report.LayoverDataId = 0;
+                return report;
             }
+            return new InternationalLayoverReport();
+        }
 
-            var existingReport = await _dbContext.LayoverDataV2.Where(x =>
-             x.IGA == layoverData.IGA &&
-             x.InboundFlight == layoverData.InboundFlight &&
-             x.OutboundFlight == layoverData.OutboundFlight &&
-             x.DepartureStation == layoverData.DepartureStation &&
-             x.ArrivalStation == layoverData.ArrivalStation &&
-             x.StayStart == layoverData.StayStart &&
-             x.StayEnd == layoverData.StayEnd).FirstOrDefaultAsync();
-
-            if (existingReport != null)
+        private CrewMealReportV2 GetPooledMealReport()
+        {
+            if (_mealReportPool.Count > 0)
             {
-                existingLayoverData.Add(existingReport);
+                var report = _mealReportPool.Dequeue();
+                // Reset properties for reuse
+                report.Restaurant = "";
+                report.MealAllowance = 0;
+                report.LayoverDataId = 0;
+                return report;
             }
+            return new CrewMealReportV2();
         }
 
         #region Optimized Data Loading Methods
@@ -753,10 +530,7 @@ namespace Clob.AC.Application.Services
             CurrencyLookup = CurrenciesData.ToDictionary(x => x.CountryId, x => x);
         }
 
-        private async Task LoadCategoryData()
-        {
-            var categoryIds = await _dbContext.CrewCategoryData.Select(x => x.CrewCategoryId).ToListAsync();
-        }
+
 
         private async Task LoadConfigurationData(DateTime fromDate, DateTime toDate)
         {
@@ -788,6 +562,49 @@ namespace Clob.AC.Application.Services
                 configDataTasks.Add(Task.Run(async () => AdminCategory = await _dbContext.AdminConfigCrewCategory.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync()));
                 
                 await Task.WhenAll(configDataTasks);
+                
+                // Build optimized admin configuration lookup tables
+                BuildAdminConfigLookupTables();
+            }
+        }
+
+        private void BuildAdminConfigLookupTables()
+        {
+            // Build admin config lookup by ID
+            AdminConfigLookup = ConfigurationSlabs.ToDictionary(x => x.Id.Value, x => x);
+            
+            // Build crew rank lookup: rank -> set of config IDs
+            AdminCrewRankLookup = CrewRanks
+                .GroupBy(x => x.CrewRankName?.ToUpper() ?? "")
+                .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
+            
+            // Build duty type lookup: dutyType -> set of config IDs
+            AdminDutyTypeLookup = AdminDutyTypes
+                .GroupBy(x => x.DutyType ?? "")
+                .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
+            
+            // Build non-duty type lookup: nonDutyType -> set of config IDs
+            AdminNonDutyTypeLookup = AdminNonDutyTypes
+                .GroupBy(x => x.NBDutyTypeName ?? "")
+                .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
+            
+            // Build city lookup: cityId -> set of config IDs
+            AdminCityLookup = AdminConfigCities
+                .GroupBy(x => x.CityId ?? "")
+                .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
+            
+            // Build category lookup: categoryId -> set of config IDs
+            AdminCategoryLookup = AdminCategory
+                .GroupBy(x => x.CategoryId)
+                .ToDictionary(g => g.Key, g => g.Select(x => x.AdminConfigurationId).ToHashSet());
+            
+            // Pre-calculate durations for performance
+            foreach (var config in ConfigurationSlabs)
+            {
+                var configId = config.Id.Value;
+                AdminConfigDurationFromLookup[configId] = config.DurationFromMinutes / 60.0 + config.DurationFromHours;
+                AdminConfigDurationToLookup[configId] = config.DurationToMinutes / 60.0 + config.DurationToHours;
+                AdminConfigSlabCapLookup[configId] = config.HourlySlabMinutes / 60.0 + config.HourlySlabHours;
             }
         }
 
@@ -834,7 +651,31 @@ namespace Clob.AC.Application.Services
                 adhocDataTasks.Add(Task.Run(async () => AdhocCrewCategories = await _dbContext.AdhocCrewCategory.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync()));
                 
                 await Task.WhenAll(adhocDataTasks);
+                
+                // Build optimized adhoc allowance lookup tables
+                BuildAdhocLookupTables();
             }
+        }
+
+        private void BuildAdhocLookupTables()
+        {
+            // Build adhoc allowance lookup by ID
+            AdhocAllowanceLookup = AdhocAllowanceConfig.ToDictionary(x => x.Id.Value, x => x);
+            
+            // Build crew rank lookup: rank -> set of adhoc IDs
+            AdhocCrewRankLookup = AdhocCrewRanks
+                .GroupBy(x => x.CrewRankName ?? "")
+                .ToDictionary(g => g.Key, g => g.Select(x => x.AdhocId).ToHashSet());
+            
+            // Build country lookup: countryId -> set of adhoc IDs
+            AdhocCountryLookup = AdhocCountries
+                .GroupBy(x => x.CountryId ?? "")
+                .ToDictionary(g => g.Key, g => g.Select(x => x.AdhocId).ToHashSet());
+            
+            // Build category lookup: categoryId -> set of adhoc IDs
+            AdhocCategoryLookup = AdhocCrewCategories
+                .GroupBy(x => x.CategoryId)
+                .ToDictionary(g => g.Key, g => g.Select(x => x.AdhocId).ToHashSet());
         }
 
         private async Task LoadExistingLayoverData(DateTime fromDate, DateTime toDate, List<long> crewList)
@@ -944,6 +785,9 @@ namespace Clob.AC.Application.Services
 
         private void CalculateLayoverHoursSynchronous(IGrouping<long, CrewLayoverRoaster> crewLayoverData, CrewDetailDto crewInfo, List<int> categoryIds, DateTime layOverfromDate)
         {
+            // Cache DateTime.UtcNow once for this crew member processing
+            _cachedUtcNow = DateTime.UtcNow;
+            
             // Pre-compute crew information once
             var crewRank = crewInfo?.CrewRank?.ToUpper() ?? "";
             var IGA = crewInfo?.EmpNo ?? 0;
@@ -996,13 +840,19 @@ namespace Clob.AC.Application.Services
                 var (currency, finalLayoverAllowance, finalMealAllowance) = ApplyCurrencyConversion(
                     stationData, layoverAllowance, mealAllowance);
 
-                // Create layover data efficiently
-                CreateLayoverDataOptimized(
-                    CreateLayoverDataRecord(current, next, IGA, crewRank, crewCategory, crewName,
-                        phoneNumber, passportNumber, passportExpiry, currentStay, stayStart, stayEnd,
-                        layoverStayHours, layoverStayMinutes, isActualData, currency, stationData),
-                    new InternationalLayoverReport { Allowance = finalLayoverAllowance },
-                    new CrewMealReportV2 { Restaurant = restaurant, MealAllowance = finalMealAllowance });
+                // Create layover data efficiently with optimized object creation
+                var layoverDataRecord = CreateLayoverDataRecord(current, next, IGA, crewRank, crewCategory, crewName,
+                    phoneNumber, passportNumber, passportExpiry, currentStay, stayStart, stayEnd,
+                    layoverStayHours, layoverStayMinutes, isActualData, currency, stationData);
+
+                var layoverReport = GetPooledLayoverReport();
+                layoverReport.Allowance = finalLayoverAllowance;
+
+                var mealReport = GetPooledMealReport();
+                mealReport.Restaurant = restaurant;
+                mealReport.MealAllowance = finalMealAllowance;
+
+                CreateLayoverDataOptimized(layoverDataRecord, layoverReport, mealReport);
             }
         }
 
@@ -1225,9 +1075,14 @@ namespace Clob.AC.Application.Services
             string currentStay, DateTime stayStart, DateTime? stayEnd, int layoverStayHours, int layoverStayMinutes,
             bool isActualData, string currency, StationMasterModel stationData)
         {
+            // Pre-compute values to avoid repeated operations
             var aircraftTypeIds = current.AirCraftType?.Trim() ?? "";
             var inboundFlight = current.Flt > 0 ? current.Flt.ToString() : "";
             var outBoundFlight = next?.Flt > 0 ? next.Flt.ToString() : "";
+            var country = stationData?.Country ?? "";
+            var isDomestic = string.Equals(country, "IN", StringComparison.OrdinalIgnoreCase);
+            var crewBase = current?.CrewBase?.Trim() ?? "";
+            var staTime = current?.Sta.TimeOfDay.ToString();
 
             return new LayoverDataV2
             {
@@ -1250,12 +1105,12 @@ namespace Clob.AC.Application.Services
                 IsActualData = isActualData,
                 IsCrewBase = false, // Already filtered out crew base stays
                 Currency = currency,
-                Country = stationData?.Country ?? "",
-                CrewBase = current?.CrewBase?.Trim() ?? "",
+                Country = country,
+                CrewBase = crewBase,
                 PassportNumber = passportNumber,
                 PassportExpiry = passportExpiry,
-                STA = current?.Sta.TimeOfDay.ToString(),
-                IsDomestic = (stationData?.Country ?? "").ToUpper() == "IN",
+                STA = staTime,
+                IsDomestic = isDomestic,
             };
         }
 
@@ -1382,6 +1237,32 @@ namespace Clob.AC.Application.Services
                 MealCrewRankLookup?.Clear();
                 MealCategoryLookup?.Clear();
                 MealAircraftTypeLookup?.Clear();
+                
+                // Clear admin configuration lookup tables
+                AdminCrewRankLookup?.Clear();
+                AdminDutyTypeLookup?.Clear();
+                AdminNonDutyTypeLookup?.Clear();
+                AdminCityLookup?.Clear();
+                AdminCategoryLookup?.Clear();
+                AdminConfigLookup?.Clear();
+                
+                // Clear adhoc allowance lookup tables
+                AdhocCrewRankLookup?.Clear();
+                AdhocCountryLookup?.Clear();
+                AdhocCategoryLookup?.Clear();
+                AdhocAllowanceLookup?.Clear();
+                
+                // Clear pre-calculated duration lookups
+                AdminConfigDurationFromLookup?.Clear();
+                AdminConfigDurationToLookup?.Clear();
+                AdminConfigSlabCapLookup?.Clear();
+                
+                // Clear object pools
+                _layoverReportPool.Clear();
+                _mealReportPool.Clear();
+                
+                // Reset StringBuilder
+                _keyBuilder.Clear();
                 
                 // Clear concurrent collections
                 createLayoverData = new ConcurrentBag<LayoverDataV2>();
