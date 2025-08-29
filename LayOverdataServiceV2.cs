@@ -5,6 +5,7 @@ using Clob.AC.Application.IServices;
 using Clob.Flight.Domain.Models;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
+using System.Text;
 
 namespace Clob.AC.Application.Services
 {
@@ -148,27 +149,73 @@ namespace Clob.AC.Application.Services
                     // Data loading completed in parallel tasks above
 
 
-                    // Process crews in parallel with optimized batching
-                    var maxConcurrency = Math.Min(Environment.ProcessorCount * 2, 10); // Limit concurrent operations
-                    var batchSize = Math.Min(1000, Math.Max(100, totalCrewEmp / maxConcurrency)); // Dynamic batch size
+                    // Process crews in parallel with conservative batching to prevent memory issues
+                    var maxConcurrency = Math.Min(Environment.ProcessorCount, 5); // More conservative concurrency limit
+                    var batchSize = Math.Min(500, Math.Max(50, totalCrewEmp / maxConcurrency)); // Smaller batch sizes
+                    
+                    // Additional safety checks for memory management
+                    var availableMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
+                    if (availableMemoryMB > 500) // If using more than 500MB, reduce batch size further
+                    {
+                        batchSize = Math.Min(batchSize, 200);
+                        _logger.LogWarning($"High memory usage detected ({availableMemoryMB}MB), reducing batch size to {batchSize}");
+                    }
 
-                    Console.WriteLine($"Processing {totalCrewEmp} crew members with max concurrency: {maxConcurrency}, batch size: {batchSize}");
+                    _logger.LogInformation($"Processing {totalCrewEmp} crew members with max concurrency: {maxConcurrency}, batch size: {batchSize}");
 
                     var semaphore = new SemaphoreSlim(maxConcurrency);
                     var processingTasks = new List<Task>();
+                    var successfulBatches = 0;
+                    var totalBatches = (int)Math.Ceiling((double)totalCrewEmp / batchSize);
+                    var failureThreshold = Math.Max(1, totalBatches / 4); // Allow up to 25% failures before stopping
 
-                    for (int i = 0; i < totalCrewEmp; i += batchSize)
+                    try
                     {
-                        var batchStart = i;
-                        var batchEnd = Math.Min(i + batchSize, totalCrewEmp);
-                        var batchEmplst = crewList.Skip(batchStart).Take(batchEnd - batchStart).ToList();
+                        for (int i = 0; i < totalCrewEmp; i += batchSize)
+                        {
+                            var batchStart = i;
+                            var batchEnd = Math.Min(i + batchSize, totalCrewEmp);
+                            var batchEmplst = crewList.Skip(batchStart).Take(batchEnd - batchStart).ToList();
+                            var batchNumber = batchStart / batchSize + 1;
 
-                        var task = ProcessCrewBatchAsync(batchEmplst, fromDate, toDate, crewInformation, categoryIds, request.FromDate, semaphore, batchStart / batchSize + 1);
-                        processingTasks.Add(task);
+                            var task = ProcessCrewBatchWithCircuitBreakerAsync(batchEmplst, fromDate, toDate, 
+                                crewInformation, categoryIds, request.FromDate, semaphore, batchNumber);
+                            processingTasks.Add(task);
+
+                            // Add delay between batch starts to prevent overwhelming the system
+                            if (processingTasks.Count >= maxConcurrency)
+                            {
+                                await Task.Delay(100); // Small delay to prevent resource spikes
+                            }
+
+                            // Monitor memory usage periodically
+                            if (batchNumber % 5 == 0) // Check every 5 batches
+                            {
+                                var currentMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
+                                if (currentMemoryMB > 1000) // If memory usage exceeds 1GB
+                                {
+                                    _logger.LogWarning($"High memory usage detected during processing: {currentMemoryMB}MB. Running GC.");
+                                    GC.Collect();
+                                    GC.WaitForPendingFinalizers();
+                                    GC.Collect();
+                                }
+                            }
+                        }
+
+                        var completedTasks = await Task.WhenAll(processingTasks);
+                        successfulBatches = completedTasks.Count(t => t.IsCompletedSuccessfully);
+
+                        _logger.LogInformation($"Batch processing completed: {successfulBatches}/{totalBatches} batches succeeded");
+                        
+                        if (successfulBatches < (totalBatches - failureThreshold))
+                        {
+                            _logger.LogWarning($"Too many batch failures detected. Only {successfulBatches} out of {totalBatches} batches succeeded.");
+                        }
                     }
-
-                    await Task.WhenAll(processingTasks);
-                    semaphore.Dispose();
+                    finally
+                    {
+                        semaphore?.Dispose();
+                    }
 
                     // Process all collected data in a single database transaction
                     await SaveLayoverDataBulk(rosterResponse);
@@ -688,26 +735,93 @@ namespace Clob.AC.Application.Services
 
         private async Task<List<CrewLayoverRoaster>> LoadCrewLayoverDataBatch(List<long> batchEmplst, DateTime fromDate, DateTime toDate)
         {
-            return await _dbContext.CrewLayoverData
-                .Where(c => batchEmplst.Contains(c.EmpNo) && c.Std >= fromDate && c.Sta <= toDate)
-                .Select(c => new CrewLayoverRoaster
+            try
+            {
+                // Add validation to prevent empty or null batch lists
+                if (batchEmplst == null || !batchEmplst.Any())
                 {
-                    EmpNo = c.EmpNo,
-                    Dep = c.Dep,
-                    Arr = c.Arr,
-                    ActDep = c.ActDep,
-                    ActArr = c.ActArr,
-                    Std = c.Std,
-                    Sta = c.Sta,
-                    Flt = c.Flt,
-                    DutyType = c.DutyType,
-                    CrewBase = c.CrewBase,
-                    AirCraftType = c.AirCraftType
-                })
-                .AsNoTracking()
-                .OrderBy(c => c.EmpNo)
-                .ThenBy(c => c.Std)
-                .ToListAsync();
+                    _logger.LogWarning("LoadCrewLayoverDataBatch called with empty or null batch list");
+                    return new List<CrewLayoverRoaster>();
+                }
+
+                // Add timeout to prevent hanging operations
+                var cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+                
+                // Split large batches to prevent memory issues
+                const int maxBatchSize = 500;
+                if (batchEmplst.Count > maxBatchSize)
+                {
+                    _logger.LogWarning($"Large batch detected ({batchEmplst.Count} items). Processing in smaller chunks.");
+                    
+                    var result = new List<CrewLayoverRoaster>();
+                    for (int i = 0; i < batchEmplst.Count; i += maxBatchSize)
+                    {
+                        var chunk = batchEmplst.Skip(i).Take(maxBatchSize).ToList();
+                        var chunkResult = await LoadCrewLayoverDataChunk(chunk, fromDate, toDate, cancellationTokenSource.Token);
+                        result.AddRange(chunkResult);
+                    }
+                    return result.OrderBy(c => c.EmpNo).ThenBy(c => c.Std).ToList();
+                }
+
+                return await LoadCrewLayoverDataChunk(batchEmplst, fromDate, toDate, cancellationTokenSource.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogError("LoadCrewLayoverDataBatch operation timed out");
+                throw new TimeoutException("LoadCrewLayoverDataBatch operation timed out after 5 minutes");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error in LoadCrewLayoverDataBatch for batch size: {batchEmplst?.Count ?? 0}");
+                throw;
+            }
+        }
+
+        private async Task<List<CrewLayoverRoaster>> LoadCrewLayoverDataChunk(List<long> batchEmplst, DateTime fromDate, DateTime toDate, CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await _dbContext.CrewLayoverData
+                    .Where(c => batchEmplst.Contains(c.EmpNo) && c.Std >= fromDate && c.Sta <= toDate)
+                    .Select(c => new CrewLayoverRoaster
+                    {
+                        EmpNo = c.EmpNo,
+                        Dep = c.Dep,
+                        Arr = c.Arr,
+                        ActDep = c.ActDep,
+                        ActArr = c.ActArr,
+                        Std = c.Std,
+                        Sta = c.Sta,
+                        Flt = c.Flt,
+                        DutyType = c.DutyType,
+                        CrewBase = c.CrewBase,
+                        AirCraftType = c.AirCraftType
+                    })
+                    .AsNoTracking()
+                    .OrderBy(c => c.EmpNo)
+                    .ThenBy(c => c.Std)
+                    .ToListAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error loading crew layover data chunk for {batchEmplst.Count} employees");
+                throw;
+            }
+        }
+
+        private async Task ProcessCrewBatchWithCircuitBreakerAsync(List<long> batchEmplst, DateTime fromDate, DateTime toDate,
+            List<CrewDetailDto> crewInformation, List<int> categoryIds, DateTime layOverfromDate,
+            SemaphoreSlim semaphore, int batchNumber)
+        {
+            try
+            {
+                await ProcessCrewBatchAsync(batchEmplst, fromDate, toDate, crewInformation, categoryIds, layOverfromDate, semaphore, batchNumber);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Circuit breaker caught exception in batch {batchNumber}");
+                // Don't rethrow to prevent terminating other batches
+            }
         }
 
         private async Task ProcessCrewBatchAsync(List<long> batchEmplst, DateTime fromDate, DateTime toDate,
@@ -718,22 +832,75 @@ namespace Clob.AC.Application.Services
             try
             {
                 var batchStartTime = DateTime.Now;
-                Console.WriteLine($"Batch {batchNumber}: Starting processing of {batchEmplst.Count} crew members at {batchStartTime.TimeOfDay}");
+                _logger.LogInformation($"Batch {batchNumber}: Starting processing of {batchEmplst.Count} crew members at {batchStartTime.TimeOfDay}");
 
-                // Load crew layover data for this batch
-                var crewLayoverData = await LoadCrewLayoverDataBatch(batchEmplst, fromDate, toDate);
-
-                if (crewLayoverData.Count > 0)
+                // Validate input parameters
+                if (batchEmplst == null || !batchEmplst.Any())
                 {
-                    // Process crews in this batch in parallel
-                    await ProcessCrewLayoverDataParallel(crewLayoverData, crewInformation, layOverfromDate, categoryIds);
+                    _logger.LogWarning($"Batch {batchNumber}: Empty or null batch list provided");
+                    return;
                 }
 
-                Console.WriteLine($"Batch {batchNumber}: Completed processing in {(DateTime.Now - batchStartTime).TotalSeconds} seconds");
+                if (crewInformation == null)
+                {
+                    _logger.LogWarning($"Batch {batchNumber}: Crew information is null");
+                    return;
+                }
+
+                // Load crew layover data for this batch with error handling
+                List<CrewLayoverRoaster> crewLayoverData = null;
+                try
+                {
+                    crewLayoverData = await LoadCrewLayoverDataBatch(batchEmplst, fromDate, toDate);
+                }
+                catch (TimeoutException tex)
+                {
+                    _logger.LogError(tex, $"Batch {batchNumber}: Timeout occurred while loading crew layover data");
+                    return; // Skip this batch and continue with others
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Batch {batchNumber}: Error loading crew layover data");
+                    return; // Skip this batch and continue with others
+                }
+
+                if (crewLayoverData != null && crewLayoverData.Count > 0)
+                {
+                    try
+                    {
+                        // Process crews in this batch in parallel
+                        await ProcessCrewLayoverDataParallel(crewLayoverData, crewInformation, layOverfromDate, categoryIds);
+                        _logger.LogInformation($"Batch {batchNumber}: Successfully processed {crewLayoverData.Count} layover records");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"Batch {batchNumber}: Error processing crew layover data");
+                        // Don't rethrow - let other batches continue processing
+                    }
+                }
+                else
+                {
+                    _logger.LogInformation($"Batch {batchNumber}: No layover data found for processing");
+                }
+
+                var processingTime = (DateTime.Now - batchStartTime).TotalSeconds;
+                _logger.LogInformation($"Batch {batchNumber}: Completed processing in {processingTime} seconds");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Batch {batchNumber}: Unexpected error in ProcessCrewBatchAsync");
+                // Don't rethrow to prevent terminating the entire process
             }
             finally
             {
-                semaphore.Release();
+                try
+                {
+                    semaphore.Release();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Batch {batchNumber}: Error releasing semaphore");
+                }
             }
         }
 
