@@ -4,12 +4,13 @@ using Clob.AC.Application.Extensions;
 using Clob.AC.Application.IServices;
 using Clob.Flight.Domain.Models;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.DependencyInjection;
 using System.Collections.Concurrent;
 using System.Text;
 
 namespace Clob.AC.Application.Services
 {
-    public class LayoverDataService(IApplicationDbContext _dbContext, IHttpService _httpService, ILogger<LayoverDataService> _logger) : ILayoverDataService
+    public class LayoverDataService(IApplicationDbContext _dbContext, IHttpService _httpService, ILogger<LayoverDataService> _logger, IServiceProvider _serviceProvider) : ILayoverDataService
     {
         // Original collections for compatibility
         private List<StationMasterModel> StationMaster = new();
@@ -152,7 +153,7 @@ namespace Clob.AC.Application.Services
                     // Process crews in parallel with conservative batching to prevent memory issues
                     var maxConcurrency = Math.Min(Environment.ProcessorCount, 5); // More conservative concurrency limit
                     var batchSize = Math.Min(500, Math.Max(50, totalCrewEmp / maxConcurrency)); // Smaller batch sizes
-
+                    
                     // Additional safety checks for memory management
                     var availableMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
                     if (availableMemoryMB > 500) // If using more than 500MB, reduce batch size further
@@ -178,7 +179,7 @@ namespace Clob.AC.Application.Services
                             var batchEmplst = crewList.Skip(batchStart).Take(batchEnd - batchStart).ToList();
                             var batchNumber = batchStart / batchSize + 1;
 
-                            var task = ProcessCrewBatchWithCircuitBreakerAsync(batchEmplst, fromDate, toDate,
+                            var task = ProcessCrewBatchWithCircuitBreakerAsync(batchEmplst, fromDate, toDate, 
                                 crewInformation, categoryIds, request.FromDate, semaphore, batchNumber);
                             processingTasks.Add(task);
 
@@ -202,11 +203,11 @@ namespace Clob.AC.Application.Services
                             }
                         }
 
-                        await Task.WhenAll(processingTasks);
-                        successfulBatches = processingTasks.Count(t => t.IsCompletedSuccessfully);
+                        var completedTasks = await Task.WhenAll(processingTasks);
+                        successfulBatches = completedTasks.Count(t => t.IsCompletedSuccessfully);
 
                         _logger.LogInformation($"Batch processing completed: {successfulBatches}/{totalBatches} batches succeeded");
-
+                        
                         if (successfulBatches < (totalBatches - failureThreshold))
                         {
                             _logger.LogWarning($"Too many batch failures detected. Only {successfulBatches} out of {totalBatches} batches succeeded.");
@@ -704,7 +705,11 @@ namespace Clob.AC.Application.Services
 
         private async Task LoadExistingLayoverData(DateTime fromDate, DateTime toDate, List<long> crewList)
         {
-            var existingKeys = await _dbContext.LayoverDataV2
+            // Use local DbContext for loading existing data to avoid concurrency issues
+            using var scope = _serviceProvider.CreateScope();
+            var localDbContext = scope.ServiceProvider.GetRequiredService<IApplicationDbContext>();
+
+            var existingKeys = await localDbContext.LayoverDataV2
                 .Where(x => crewList.Contains(x.IGA) && x.StayStart >= fromDate && x.StayEnd <= toDate)
                 .Select(x => $"{x.IGA}_{x.InboundFlight}_{x.OutboundFlight}_{x.DepartureStation}_{x.ArrivalStation}_{x.StayStart:yyyyMMddHHmm}_{x.StayEnd:yyyyMMddHHmm}")
                 .ToListAsync();
@@ -746,13 +751,13 @@ namespace Clob.AC.Application.Services
 
                 // Add timeout to prevent hanging operations
                 var cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(5));
-
+                
                 // Split large batches to prevent memory issues
                 const int maxBatchSize = 500;
                 if (batchEmplst.Count > maxBatchSize)
                 {
                     _logger.LogWarning($"Large batch detected ({batchEmplst.Count} items). Processing in smaller chunks.");
-
+                    
                     var result = new List<CrewLayoverRoaster>();
                     for (int i = 0; i < batchEmplst.Count; i += maxBatchSize)
                     {
@@ -779,9 +784,13 @@ namespace Clob.AC.Application.Services
 
         private async Task<List<CrewLayoverRoaster>> LoadCrewLayoverDataChunk(List<long> batchEmplst, DateTime fromDate, DateTime toDate, CancellationToken cancellationToken)
         {
+            // Create local scope and DbContext to avoid concurrency issues
+            using var scope = _serviceProvider.CreateScope();
+            var localDbContext = scope.ServiceProvider.GetRequiredService<IApplicationDbContext>();
+
             try
             {
-                return await _dbContext.CrewLayoverData
+                return await localDbContext.CrewLayoverData
                     .Where(c => batchEmplst.Contains(c.EmpNo) && c.Std >= fromDate && c.Sta <= toDate)
                     .Select(c => new CrewLayoverRoaster
                     {
@@ -804,7 +813,7 @@ namespace Clob.AC.Application.Services
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Error loading crew layover data chunk for {batchEmplst.Count} employees");
+                _logger.LogError(ex, $"Error loading crew layover data chunk for {batchEmplst.Count} employees using local DbContext");
                 throw;
             }
         }
@@ -1264,7 +1273,10 @@ namespace Clob.AC.Application.Services
             Console.WriteLine($"Bulk save transaction begin at {transactionTime.TimeOfDay}");
             Console.WriteLine($"Total layover records to save: {createLayoverData.Count}");
 
-            using var transaction = _dbContext.Database.BeginTransaction();
+            // Create local scope and DbContext for bulk save operations to avoid concurrency issues
+            using var scope = _serviceProvider.CreateScope();
+            var localDbContext = scope.ServiceProvider.GetRequiredService<IApplicationDbContext>();
+            using var transaction = localDbContext.Database.BeginTransaction();
 
             try
             {
@@ -1287,12 +1299,12 @@ namespace Clob.AC.Application.Services
                         .ToList();
 
                     if (existingCrewMeals.Any())
-                        await _dbContext.CrewMealReportV2.BulkDeleteAsync(existingCrewMeals);
+                        await localDbContext.CrewMealReportV2.BulkDeleteAsync(existingCrewMeals);
 
                     if (existingLayoverReport.Any())
-                        await _dbContext.InternationalLayoverReport.BulkDeleteAsync(existingLayoverReport);
+                        await localDbContext.InternationalLayoverReport.BulkDeleteAsync(existingLayoverReport);
 
-                    await _dbContext.LayoverDataV2.BulkDeleteAsync(existingDataList);
+                    await localDbContext.LayoverDataV2.BulkDeleteAsync(existingDataList);
                 }
 
                 // Insert new records in bulk
@@ -1300,7 +1312,7 @@ namespace Clob.AC.Application.Services
                 {
                     Console.WriteLine($"Inserting {createDataList.Count} new records...");
 
-                    await _dbContext.LayoverDataV2.BulkInsertAsync(createDataList);
+                    await localDbContext.LayoverDataV2.BulkInsertAsync(createDataList);
 
                     // Update foreign keys for related entities
                     createDataList
@@ -1324,12 +1336,12 @@ namespace Clob.AC.Application.Services
                         .ToList();
 
                     if (entityCrewMeals.Any())
-                        await _dbContext.CrewMealReportV2.BulkInsertAsync(entityCrewMeals);
+                        await localDbContext.CrewMealReportV2.BulkInsertAsync(entityCrewMeals);
 
                     if (entityLayoverReport.Any())
-                        await _dbContext.InternationalLayoverReport.BulkInsertAsync(entityLayoverReport);
+                        await localDbContext.InternationalLayoverReport.BulkInsertAsync(entityLayoverReport);
 
-                    await _dbContext.SaveChangesAsync();
+                    await localDbContext.SaveChangesAsync();
 
                     rosterResponse.Status = true;
                     rosterResponse.RowsInserted += createDataList.Count;
@@ -1435,6 +1447,10 @@ namespace Clob.AC.Application.Services
         /// <returns></returns>
         private async Task AddReportHistory(ReportHistoryModel reportHistoryModel, RosterResponse rosterResponse)
         {
+            // Use local DbContext to avoid potential concurrency issues
+            using var scope = _serviceProvider.CreateScope();
+            var localDbContext = scope.ServiceProvider.GetRequiredService<IApplicationDbContext>();
+
             try
             {
                 reportHistoryModel.Error = rosterResponse.Error != null ? rosterResponse.Error + " -Stacktrace " + rosterResponse.Stacktrace : null;
@@ -1443,8 +1459,8 @@ namespace Clob.AC.Application.Services
                 reportHistoryModel.UpdatedCount = rosterResponse.RowsUpdated;
                 reportHistoryModel.InsertedCount = rosterResponse.RowsInserted;
 
-                _dbContext.ReportHistory.Add(reportHistoryModel);
-                await _dbContext.SaveChangesAsync();
+                localDbContext.ReportHistory.Add(reportHistoryModel);
+                await localDbContext.SaveChangesAsync();
             }
             catch (Exception ex)
             {
