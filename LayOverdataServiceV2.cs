@@ -138,21 +138,18 @@ namespace Clob.AC.Application.Services
 
                 if (totalCrewEmp > 0 && crewInformation.Count > 0)
                 {
-                    Console.WriteLine($"Loading reference data in parallel...");
+                    Console.WriteLine($"Loading reference data...");
                     var dataLoadingStartTime = DateTime.Now;
                     
-                    // Load all reference data in parallel
-                    var dataLoadingTasks = new List<Task>
-                    {
-                        LoadStationMasterData(),
-                        LoadCurrencyData(),
-                        LoadConfigurationData(fromDate, toDate),
-                        LoadExistingLayoverData(fromDate, toDate, crewList)
-                    };
-
+                    // Load all reference data sequentially to avoid DbContext concurrency issues
+                    // Note: Each method internally can still use parallel operations with separate contexts if needed
+                    await LoadStationMasterData();
+                    await LoadCurrencyData();
+                    await LoadConfigurationData(fromDate, toDate);
+                    
                     categoryIds = await _dbContext.CrewCategoryData.Select(x => x.CrewCategoryId).ToListAsync();
                     
-                    await Task.WhenAll(dataLoadingTasks);
+                    await LoadExistingLayoverData(fromDate, toDate, crewList);
                     
                     Console.WriteLine($"Reference data loaded in {(DateTime.Now - dataLoadingStartTime).TotalSeconds} seconds.");
 
@@ -534,13 +531,10 @@ namespace Clob.AC.Application.Services
 
         private async Task LoadConfigurationData(DateTime fromDate, DateTime toDate)
         {
-            var configTasks = new List<Task>();
-            
-            configTasks.Add(LoadAdminConfigurations(fromDate, toDate));
-            configTasks.Add(LoadMealConfigurations(fromDate, toDate));
-            configTasks.Add(LoadAdhocConfigurations(fromDate, toDate));
-            
-            await Task.WhenAll(configTasks);
+            // Load configurations sequentially to avoid DbContext concurrency issues
+            await LoadAdminConfigurations(fromDate, toDate);
+            await LoadMealConfigurations(fromDate, toDate);
+            await LoadAdhocConfigurations(fromDate, toDate);
         }
 
         private async Task LoadAdminConfigurations(DateTime fromDate, DateTime toDate)
@@ -553,15 +547,12 @@ namespace Clob.AC.Application.Services
 
             if (configIds?.Any() == true)
             {
-                var configDataTasks = new List<Task>();
-                
-                configDataTasks.Add(Task.Run(async () => CrewRanks = await _dbContext.AdminConfigCrewRank.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync()));
-                configDataTasks.Add(Task.Run(async () => AdminDutyTypes = await _dbContext.AdminConfigDutyType.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync()));
-                configDataTasks.Add(Task.Run(async () => AdminNonDutyTypes = await _dbContext.AdminConfigNBDutyType.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync()));
-                configDataTasks.Add(Task.Run(async () => AdminConfigCities = await _dbContext.AdminConfigCity.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync()));
-                configDataTasks.Add(Task.Run(async () => AdminCategory = await _dbContext.AdminConfigCrewCategory.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync()));
-                
-                await Task.WhenAll(configDataTasks);
+                // Load configuration data sequentially to avoid DbContext concurrency issues
+                CrewRanks = await _dbContext.AdminConfigCrewRank.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync();
+                AdminDutyTypes = await _dbContext.AdminConfigDutyType.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync();
+                AdminNonDutyTypes = await _dbContext.AdminConfigNBDutyType.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync();
+                AdminConfigCities = await _dbContext.AdminConfigCity.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync();
+                AdminCategory = await _dbContext.AdminConfigCrewCategory.Where(c => configIds.Contains(c.AdminConfigurationId)).ToListAsync();
                 
                 // Build optimized admin configuration lookup tables
                 BuildAdminConfigLookupTables();
@@ -618,13 +609,10 @@ namespace Clob.AC.Application.Services
 
             if (mealConfigIds?.Any() == true)
             {
-                var mealDataTasks = new List<Task>();
-                
-                mealDataTasks.Add(Task.Run(async () => MealCrewRanks = await _dbContext.MealConfigCrewRanks.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync()));
-                mealDataTasks.Add(Task.Run(async () => MealCrewCategoris = await _dbContext.MealConfigCrewCategories.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync()));
-                mealDataTasks.Add(Task.Run(async () => MealAircraftTypes = await _dbContext.MealConfigAircraftTypes.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync()));
-                
-                await Task.WhenAll(mealDataTasks);
+                // Load meal configuration data sequentially to avoid DbContext concurrency issues
+                MealCrewRanks = await _dbContext.MealConfigCrewRanks.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync();
+                MealCrewCategoris = await _dbContext.MealConfigCrewCategories.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync();
+                MealAircraftTypes = await _dbContext.MealConfigAircraftTypes.Where(c => mealConfigIds.Contains(c.MealConfigId)).ToListAsync();
                 
                 // Create lookup for meal configurations by station
                 MealConfigByStation = MealConfigurations.GroupBy(x => x.Station).ToDictionary(g => g.Key, g => g.ToList());
@@ -644,13 +632,10 @@ namespace Clob.AC.Application.Services
 
             if (adhocIds?.Any() == true)
             {
-                var adhocDataTasks = new List<Task>();
-                
-                adhocDataTasks.Add(Task.Run(async () => AdhocCrewRanks = await _dbContext.AdhocCrewRank.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync()));
-                adhocDataTasks.Add(Task.Run(async () => AdhocCountries = await _dbContext.AdhocCountry.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync()));
-                adhocDataTasks.Add(Task.Run(async () => AdhocCrewCategories = await _dbContext.AdhocCrewCategory.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync()));
-                
-                await Task.WhenAll(adhocDataTasks);
+                // Load adhoc configuration data sequentially to avoid DbContext concurrency issues
+                AdhocCrewRanks = await _dbContext.AdhocCrewRank.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync();
+                AdhocCountries = await _dbContext.AdhocCountry.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync();
+                AdhocCrewCategories = await _dbContext.AdhocCrewCategory.Where(c => adhocIds.Contains(c.AdhocId)).ToListAsync();
                 
                 // Build optimized adhoc allowance lookup tables
                 BuildAdhocLookupTables();
