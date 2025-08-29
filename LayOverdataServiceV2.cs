@@ -152,7 +152,7 @@ namespace Clob.AC.Application.Services
                     // Process crews in parallel with conservative batching to prevent memory issues
                     var maxConcurrency = Math.Min(Environment.ProcessorCount, 5); // More conservative concurrency limit
                     var batchSize = Math.Min(500, Math.Max(50, totalCrewEmp / maxConcurrency)); // Smaller batch sizes
-                    
+
                     // Additional safety checks for memory management
                     var availableMemoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
                     if (availableMemoryMB > 500) // If using more than 500MB, reduce batch size further
@@ -178,7 +178,7 @@ namespace Clob.AC.Application.Services
                             var batchEmplst = crewList.Skip(batchStart).Take(batchEnd - batchStart).ToList();
                             var batchNumber = batchStart / batchSize + 1;
 
-                            var task = ProcessCrewBatchWithCircuitBreakerAsync(batchEmplst, fromDate, toDate, 
+                            var task = ProcessCrewBatchWithCircuitBreakerAsync(batchEmplst, fromDate, toDate,
                                 crewInformation, categoryIds, request.FromDate, semaphore, batchNumber);
                             processingTasks.Add(task);
 
@@ -202,11 +202,11 @@ namespace Clob.AC.Application.Services
                             }
                         }
 
-                        var completedTasks = await Task.WhenAll(processingTasks);
-                        successfulBatches = completedTasks.Count(t => t.IsCompletedSuccessfully);
+                        await Task.WhenAll(processingTasks);
+                        successfulBatches = processingTasks.Count(t => t.IsCompletedSuccessfully);
 
                         _logger.LogInformation($"Batch processing completed: {successfulBatches}/{totalBatches} batches succeeded");
-                        
+
                         if (successfulBatches < (totalBatches - failureThreshold))
                         {
                             _logger.LogWarning($"Too many batch failures detected. Only {successfulBatches} out of {totalBatches} batches succeeded.");
@@ -746,13 +746,13 @@ namespace Clob.AC.Application.Services
 
                 // Add timeout to prevent hanging operations
                 var cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(5));
-                
+
                 // Split large batches to prevent memory issues
                 const int maxBatchSize = 500;
                 if (batchEmplst.Count > maxBatchSize)
                 {
                     _logger.LogWarning($"Large batch detected ({batchEmplst.Count} items). Processing in smaller chunks.");
-                    
+
                     var result = new List<CrewLayoverRoaster>();
                     for (int i = 0; i < batchEmplst.Count; i += maxBatchSize)
                     {
